@@ -75,6 +75,7 @@ my-project/
 | [Advanced](docs/advanced.md) | Cross-validation, custom optimizers, GANs, step-based training, eval callbacks |
 | [Commands](docs/commands.md) | Full Makefile reference, GPU tiers, Docker, data manifest |
 | [Setup](docs/setup.md) | Local tools, SSH, shared storage, Docker image, SLURM requirements |
+| [Config reference](docs/config-reference.md) | Every config key, task interface, full example YAML |
 | [Troubleshooting](docs/troubleshooting.md) | Common failures, NAS quirks, email notifications |
 
 ## Philosophy: scaffold, don't upstream
