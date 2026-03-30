@@ -194,6 +194,70 @@ def evaluate(cfg):
     result = evaluator.evaluate()
 ```
 
+## Distributed training (DDP / FSDP)
+
+The Trainer uses HF Accelerate under the hood. Distributed strategy is controlled via config — no code changes needed.
+
+### Config
+
+```yaml
+distributed:
+  strategy: auto              # auto | ddp | fsdp
+  fsdp:
+    version: 2
+    sharding_strategy: FULL_SHARD  # FULL_SHARD | SHARD_GRAD_OP | NO_SHARD
+    cpu_offload: false
+    state_dict_type: FULL_STATE_DICT  # FULL_STATE_DICT | SHARDED_STATE_DICT
+    reshard_after_forward: true
+```
+
+`strategy: auto` (the default) lets Accelerate decide — single-GPU uses no wrapper, multi-GPU uses DDP. Set `strategy: fsdp` explicitly for FSDP.
+
+### Running locally
+
+```bash
+make train NUM_GPUS=2                                          # 2-GPU, auto strategy
+make train NUM_GPUS=4 TRAIN_ARGS="distributed.strategy=fsdp"  # 4-GPU FSDP
+```
+
+### Running on the cluster
+
+The SLURM script auto-detects the number of GPUs and launches with `accelerate` when there are multiple:
+
+```bash
+make submit TIER=high GRES=gpu:4                               # 4-GPU job, auto strategy
+make submit TIER=high GRES=gpu:4 TRAIN_ARGS="distributed.strategy=fsdp"  # FSDP
+```
+
+### FSDP auto-wrap policy
+
+For large models that need custom FSDP wrapping (e.g., wrapping each transformer layer individually), export `build_fsdp_wrap_policy` from your task:
+
+```python
+def build_fsdp_wrap_policy(model, cfg):
+    """Return an FSDP auto-wrap policy for the model."""
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from my_package.models import TransformerBlock
+
+    return functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={TransformerBlock},
+    )
+```
+
+This is optional — most models work fine without a custom wrap policy.
+
+### What the Trainer handles automatically
+
+- Model, optimizer, and dataloaders are wrapped via `accelerator.prepare()`
+- Gradient accumulation uses `accelerator.accumulate()` for correct sync
+- Validation loss is gathered across processes with `accelerator.gather()`
+- Checkpoints use `accelerator.save_state()` / `load_state()` (handles FSDP state dicts)
+- Logging, metrics, and checkpoint metadata are written only on the main process
+- Distributed sampler gets `set_epoch()` each epoch for proper shuffling
+
+No task code needs to know about distributed training.
+
 ## Optional task overrides summary
 
 All of these are optional exports from your task module:
@@ -202,6 +266,7 @@ All of these are optional exports from your task module:
 |----------|-------------------|
 | `build_optimizer(model, cfg)` | Default AdamW |
 | `build_scheduler(optimizer, cfg)` | Default cosine + warmup |
+| `build_fsdp_wrap_policy(model, cfg)` | No auto-wrap policy |
 | `build_eval_callbacks(cfg)` | No callbacks |
 | `on_complete(cfg, fold_results)` | No-op after sequential CV |
 | `run(cfg)` | Entire training loop |
