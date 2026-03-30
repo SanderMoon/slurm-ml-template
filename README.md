@@ -16,7 +16,7 @@ See [docs/setup.md](docs/setup.md) for detailed setup instructions.
 ### Create a new project
 
 ```bash
-copier copy --trust git@github.com:SanderMoon/ml-template.git ~/dev/my-project
+copier copy --trust git@github.com:SanderMoon/slurm-ml-template.git ~/dev/my-project
 ```
 
 Copier will prompt you for project name, cluster details (SSH host, NAS paths, Docker registry, GPU tiers), and optional features. There are no defaults for personal values — you must fill in your own.
@@ -38,7 +38,7 @@ make train TRAIN_ARGS="task=example training.epochs=5"        # train for 5 epoc
 make eval EVAL_ARGS="task=example"                            # evaluate best checkpoint
 ```
 
-Once this works, implement your own task in `experiments/tasks/classification.py`.
+Once this works, create your own task in `experiments/tasks/` following the same interface.
 
 ## What you get
 
@@ -50,7 +50,7 @@ my-project/
 │   └── utils.py             Library utilities (seed_everything)
 ├── experiments/             Training pipeline (NOT distributed)
 │   ├── tasks/
-│   │   └── classification.py  Your training recipe (fill this in)
+│   │   └── example.py        Example task (synthetic data, linear model)
 │   ├── train.py             Dispatcher (loads task, assembles Trainer)
 │   ├── trainer.py           Trainer (Accelerate, checkpointing, logging, preemption)
 │   ├── eval.py              Evaluator (checkpoint loading, fold aggregation)
@@ -123,7 +123,7 @@ newml() {
         -d nodes_high="" \
         -d nodes_medium="" \
         -d nodes_low="" \
-        git@github.com:SanderMoon/ml-template.git "$dest"
+        git@github.com:SanderMoon/slurm-ml-template.git "$dest"
 }
 ```
 
