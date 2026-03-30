@@ -1,0 +1,15 @@
+# Project-level Docker image
+# Builds on ml-base (which has PyTorch + common ML deps).
+# Only adds project-specific dependencies not in ml-base.
+FROM {{ base_docker_image }}
+
+WORKDIR /workspace
+
+# Install any project-specific deps not already in ml-base.
+# Uses a stub src/ so hatchling can resolve the package.
+# Project source is mounted at runtime (NAS or bind mount), not baked in.
+COPY pyproject.toml .
+RUN mkdir -p src/{{ project_slug }} && \
+    touch src/{{ project_slug }}/__init__.py README.md && \
+    uv pip install --system . && \
+    rm -rf src/ README.md

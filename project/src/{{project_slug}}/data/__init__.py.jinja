@@ -1,0 +1,22 @@
+"""Data utilities for {{ project_name }}.
+
+Put reusable data loading and processing code here — things that a consumer
+of your model would also need when working with their own data.
+
+**Belongs here** (technique-level, tied to the model):
+    - Custom collators (e.g., padding variable-length sequences)
+    - Domain transforms (e.g., patch extraction from whole-slide images)
+    - Specialized batching strategies (e.g., sequence packing with a token budget)
+    - Dataset classes that encode how the model expects to receive data
+      (e.g., a bag-of-instances dataset for MIL)
+
+**Belongs in experiments/tasks/** (dataset-level, tied to a specific experiment):
+    - Which CSV to load, which columns are labels
+    - Train/val/test split logic for a specific dataset
+    - Path resolution and file format parsing
+    - Thin wrappers that just read files from a directory
+
+Rule of thumb: if someone using your model on their own data would need
+this code, it belongs here. If it only makes sense for your specific
+experiment setup, keep it in the task.
+"""

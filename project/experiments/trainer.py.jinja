@@ -1,0 +1,541 @@
+"""Trainer for {{ project_name }}.
+
+Flexible training engine that handles the full training lifecycle:
+- HF Accelerate for distributed training and mixed precision
+- Periodic checkpointing with top-K retention and run-ID naming
+- SLURM preemption handling (SIGUSR1)
+- W&B + TensorBoard + JSON metrics logging
+- Automatic resume from latest checkpoint
+- Callback system for extensibility
+
+The Trainer accepts pre-built DataLoaders and callables for loss/evaluation,
+keeping model creation, data loading, and loss computation in user code.
+"""
+
+import json
+import logging
+import signal
+import sys
+import uuid
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import torch
+from accelerate import Accelerator
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+log = logging.getLogger(__name__)
+
+
+class TrainerCallback:
+    """Base class for trainer callbacks. Override any method you need."""
+
+    def on_train_begin(self, trainer: "Trainer") -> None:
+        pass
+
+    def on_train_end(self, trainer: "Trainer") -> None:
+        pass
+
+    def on_epoch_begin(self, trainer: "Trainer", epoch: int) -> None:
+        pass
+
+    def on_epoch_end(self, trainer: "Trainer", epoch: int, metrics: dict) -> None:
+        pass
+
+    def on_step_end(self, trainer: "Trainer", step: int, loss: float, metrics: dict) -> None:
+        pass
+
+    def on_validation_end(self, trainer: "Trainer", epoch: int, metrics: dict) -> None:
+        pass
+
+    def on_checkpoint_saved(self, trainer: "Trainer", path: Path) -> None:
+        pass
+
+
+class EarlyStoppingCallback(TrainerCallback):
+    """Stop training when a monitored metric stops improving.
+
+    Args:
+        patience: Number of validation checks with no improvement before stopping.
+        min_delta: Minimum change in the monitored metric to qualify as improvement.
+    """
+
+    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.wait = 0
+
+    def on_validation_end(self, trainer: "Trainer", epoch: int, metrics: dict) -> None:
+        metric_name = trainer.cfg.checkpointing.val_metric
+        value = metrics.get(metric_name)
+        if value is None:
+            return
+
+        # Apply min_delta: for min-mode, threshold is best - delta (lower is better,
+        # so we need to beat best by at least delta). For max-mode, best + delta.
+        is_min = trainer.cfg.checkpointing.get("val_metric_mode", "min") == "min"
+        threshold = trainer.best_metric - self.min_delta if is_min else trainer.best_metric + self.min_delta
+
+        if trainer._metric_is_better(value, threshold):
+            self.wait = 0
+        else:
+            self.wait += 1
+            log.info(f"EarlyStopping: no improvement for {self.wait}/{self.patience} checks")
+            if self.wait >= self.patience:
+                log.info("EarlyStopping: patience exhausted, stopping training")
+                trainer.should_stop = True
+
+
+class Trainer:
+    """Flexible training engine.
+
+    Accepts pre-built DataLoaders and a ``compute_loss`` callable so that model
+    creation, data loading, and loss computation stay in user code.
+
+    Supports both epoch-based and step-based training (set ``max_steps`` in
+    config). For multi-model or multi-pass training (GANs, contrastive
+    learning, distillation), subclass and override ``_train_step``.
+
+    Args:
+        model: The model to train.
+        train_loader: Pre-built training DataLoader (any sampler/collation).
+        optimizer: Pre-built optimizer.
+        compute_loss: Callable ``(model, batch) -> loss_tensor | dict``.
+            If a dict is returned, it must contain a ``"loss"`` key with
+            the scalar loss tensor; all other entries are treated as extra
+            metrics and propagated to logging and callbacks.
+        cfg: OmegaConf config with ``training``, ``checkpointing``, and
+            ``logging`` sections.
+        val_loader: Optional pre-built validation DataLoader.
+        scheduler: Optional LR scheduler. Stepped per-epoch by default;
+            set ``scheduler_step_per_batch=True`` for per-step schedulers.
+        evaluate: Optional callable ``(model, val_loader, accelerator) -> dict``
+            for custom validation (e.g. AUROC). If not provided, validation
+            computes average loss using ``compute_loss``.
+        checkpoint_dir: Override ``cfg.paths.checkpoint_dir`` (useful for
+            per-fold directories).
+        output_dir: Override ``cfg.paths.output_dir``.
+        resume_from: Explicit checkpoint path. If None, auto-resumes from
+            the latest checkpoint in ``checkpoint_dir``.
+        callbacks: Optional list of TrainerCallback instances.
+        scheduler_step_per_batch: If True, call ``scheduler.step()`` after
+            each optimizer step instead of after each epoch.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        train_loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        compute_loss: Callable[[torch.nn.Module, Any], torch.Tensor | dict[str, torch.Tensor]],
+        cfg: DictConfig,
+        val_loader: DataLoader | None = None,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+        evaluate: Callable[[torch.nn.Module, DataLoader, Accelerator], dict[str, float]] | None = None,
+        checkpoint_dir: Path | None = None,
+        output_dir: Path | None = None,
+        resume_from: Path | None = None,
+        callbacks: list[TrainerCallback] | None = None,
+        scheduler_step_per_batch: bool = False,
+    ):
+        self.cfg = cfg
+        self.callbacks = callbacks or []
+        self.compute_loss = compute_loss
+        self.evaluate_fn = evaluate
+        self.scheduler_step_per_batch = scheduler_step_per_batch
+        t = cfg.training
+        c = cfg.checkpointing
+
+        self.checkpoint_dir = checkpoint_dir or Path(cfg.paths.checkpoint_dir)
+        self.output_dir = output_dir or Path(cfg.paths.output_dir)
+        self.run_id = uuid.uuid4().hex[:8]
+
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=t.get("grad_accum_steps", 1),
+            log_with=self._log_backends(),
+            project_dir=str(self.output_dir),
+        )
+
+        # Store sampler ref before Accelerate wraps the loader (for set_epoch)
+        self._train_sampler = getattr(train_loader, "batch_sampler", None) or getattr(train_loader, "sampler", None)
+
+        self.model, self.optimizer, self.train_loader = self.accelerator.prepare(model, optimizer, train_loader)
+        self.val_loader = self.accelerator.prepare(val_loader) if val_loader else None
+        self.scheduler = scheduler
+
+        self.global_step = 0
+        self.start_epoch = 0
+        self.current_epoch = 0
+        self.should_stop = False
+        self.best_metric = float("inf") if c.get("val_metric_mode", "min") == "min" else float("-inf")
+        self._metric_is_better = (
+            (lambda new, best: new < best)
+            if c.get("val_metric_mode", "min") == "min"
+            else (lambda new, best: new > best)
+        )
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # SLURM preemption handler
+        signal.signal(signal.SIGUSR1, self._handle_preemption)
+
+        # Resume: explicit path → use it; None → auto-discover; False → fresh start
+        if resume_from is False:
+            resume_path = None
+        else:
+            resume_path = resume_from or self._find_latest_checkpoint()
+        if resume_path:
+            self._load_checkpoint(resume_path)
+
+        # Init trackers (W&B, TensorBoard)
+        if self.accelerator.is_main_process:
+            flat_config = self._flatten_config(OmegaConf.to_container(cfg, resolve=True))
+            self.accelerator.init_trackers(
+                project_name=cfg.logging.wandb_project,
+                config=flat_config,
+            )
+
+    def _log_backends(self) -> list[str]:
+        backends = ["tensorboard"]
+        if self.cfg.logging.use_wandb:
+            backends.append("wandb")
+        return backends
+
+    @staticmethod
+    def _flatten_config(d: dict, prefix: str = "") -> dict:
+        """Flatten nested config to dot-separated scalar keys for TensorBoard hparams."""
+        flat = {}
+        for k, v in d.items():
+            key = f"{prefix}{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(Trainer._flatten_config(v, f"{key}."))
+            elif isinstance(v, (list, tuple)):
+                flat[key] = str(v)
+            elif v is None:
+                flat[key] = "null"
+            else:
+                flat[key] = v
+        return flat
+
+    def _fire(self, method: str, **kwargs):
+        for cb in self.callbacks:
+            getattr(cb, method)(self, **kwargs)
+
+    def train(self):
+        t = self.cfg.training
+        c = self.cfg.checkpointing
+        save_every = c.get("save_every_n_epochs", 5)
+        validate_every = c.get("validate_every_n_epochs") or save_every
+        max_steps = t.get("max_steps")
+
+        log.info(f"Starting training from epoch {self.start_epoch} (run {self.run_id})")
+        if max_steps:
+            log.info(f"  Max steps: {max_steps}")
+        else:
+            log.info(f"  Epochs: {t.epochs}")
+        log.info(f"  Grad accumulation: {t.get('grad_accum_steps', 1)}")
+        if max_steps:
+            save_steps = c.get("save_every_n_steps")
+            if save_steps:
+                log.info(f"  Checkpointing: every {save_steps} steps, top-{c.get('keep_top_k', 3)}")
+            else:
+                log.info("  Checkpointing: disabled (set save_every_n_steps for step-based)")
+        elif save_every:
+            log.info(f"  Checkpointing: every {save_every} epochs, top-{c.get('keep_top_k', 3)}")
+        else:
+            log.info("  Checkpointing: disabled")
+
+        self._fire("on_train_begin")
+
+        max_epochs = t.epochs if not max_steps else 10**9
+
+        for epoch in range(self.start_epoch, max_epochs):
+            self.current_epoch = epoch
+
+            # Set epoch on sampler (for distributed training / custom samplers)
+            if hasattr(self._train_sampler, "set_epoch"):
+                self._train_sampler.set_epoch(epoch)
+
+            self._fire("on_epoch_begin", epoch=epoch)
+            train_metrics = self._train_epoch(epoch)
+
+            # Epoch-based validation & checkpointing (skipped when using max_steps;
+            # step-based triggers are handled inside _train_epoch instead)
+            val_metrics = {}
+            if not max_steps:
+                if self.val_loader and validate_every and (epoch + 1) % validate_every == 0:
+                    val_metrics = self._validate(epoch)
+                    self._fire("on_validation_end", epoch=epoch, metrics=val_metrics)
+
+                if save_every and (epoch + 1) % save_every == 0:
+                    metric_val = val_metrics.get(c.val_metric, train_metrics.get("train_loss"))
+                    self._save_checkpoint(epoch, metric_val)
+
+            epoch_metrics = {"epoch": epoch, **train_metrics, **val_metrics}
+            self._log_epoch_metrics(epoch_metrics)
+            self._fire("on_epoch_end", epoch=epoch, metrics=epoch_metrics)
+
+            if self.scheduler and not self.scheduler_step_per_batch:
+                self.scheduler.step()
+
+            if self.should_stop:
+                log.info(f"Training stopped early at epoch {epoch}.")
+                break
+            if max_steps and self.global_step >= max_steps:
+                log.info(f"Reached max_steps ({max_steps}), stopping.")
+                break
+
+        self._fire("on_train_end")
+        self.accelerator.end_training()
+        log.info("Training complete.")
+
+    def _train_step(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
+        """Forward + backward for a single batch.
+
+        Override this for multi-model or multi-pass training (e.g., GANs,
+        contrastive learning, teacher-student distillation).
+
+        Returns:
+            loss: Scalar loss tensor (already backward-ed).
+            metrics: Additional step-level metrics (logged and passed to callbacks).
+        """
+        result = self.compute_loss(self.model, batch)
+        if isinstance(result, dict):
+            loss = result["loss"]
+            metrics = {
+                k: v.detach().item() if isinstance(v, torch.Tensor) else v
+                for k, v in result.items()
+                if k != "loss"
+            }
+        else:
+            loss = result
+            metrics = {}
+        self.accelerator.backward(loss)
+        return loss, metrics
+
+    def _train_epoch(self, epoch: int) -> dict:
+        self.model.train()
+        total_loss = 0.0
+        num_steps = 0
+        metric_totals: dict[str, float] = {}
+        max_grad_norm = self.cfg.training.get("max_grad_norm", 1.0)
+        max_steps = self.cfg.training.get("max_steps")
+        c = self.cfg.checkpointing
+        save_every_steps = c.get("save_every_n_steps") if max_steps else None
+        validate_every_steps = c.get("validate_every_n_steps") if max_steps else None
+
+        progress = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch}",
+            disable=not self.accelerator.is_main_process,
+        )
+
+        for batch in progress:
+            with self.accelerator.accumulate(self.model):
+                loss, step_metrics = self._train_step(batch)
+
+                if self.accelerator.sync_gradients and max_grad_norm:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                if self.scheduler and self.scheduler_step_per_batch:
+                    self.scheduler.step()
+
+            if self.accelerator.sync_gradients:
+                self.global_step += 1
+                loss_val = loss.detach().item()
+                total_loss += loss_val
+                num_steps += 1
+
+                for k, v in step_metrics.items():
+                    metric_totals[k] = metric_totals.get(k, 0.0) + v
+
+                if self.global_step % self.cfg.logging.log_every_n_steps == 0:
+                    log_dict = {
+                        "train/loss": loss_val,
+                        "train/lr": self.optimizer.param_groups[0]["lr"],
+                        "train/epoch": epoch,
+                        "train/step": self.global_step,
+                    }
+                    for k, v in step_metrics.items():
+                        log_dict[f"train/{k}"] = v
+                    self.accelerator.log(log_dict, step=self.global_step)
+
+                self._fire("on_step_end", step=self.global_step, loss=loss_val, metrics=step_metrics)
+                progress.set_postfix(loss=f"{loss_val:.4f}")
+
+                # Step-based validation & checkpointing (when using max_steps)
+                if max_steps:
+                    step_val_metrics = {}
+                    if self.val_loader and validate_every_steps and self.global_step % validate_every_steps == 0:
+                        step_val_metrics = self._validate(epoch)
+                        self._fire("on_validation_end", epoch=epoch, metrics=step_val_metrics)
+
+                    if save_every_steps and self.global_step % save_every_steps == 0:
+                        metric_val = step_val_metrics.get(c.val_metric) if step_val_metrics else None
+                        self._save_checkpoint(epoch, metric_val)
+
+                    if self.global_step >= max_steps:
+                        break
+
+        avg_loss = total_loss / max(num_steps, 1)
+        result = {"train_loss": avg_loss}
+        for k, v in metric_totals.items():
+            result[f"train_{k}"] = v / max(num_steps, 1)
+        return result
+
+    @torch.no_grad()
+    def _validate(self, epoch: int) -> dict:
+        self.model.eval()
+
+        # Custom evaluate function takes full control
+        if self.evaluate_fn:
+            return self.evaluate_fn(self.model, self.val_loader, self.accelerator)
+
+        # Default: average loss over validation set
+        total_loss = 0.0
+        num_steps = 0
+
+        progress = tqdm(
+            self.val_loader,
+            desc=f"Val {epoch}",
+            disable=not self.accelerator.is_main_process,
+        )
+
+        for batch in progress:
+            result = self.compute_loss(self.model, batch)
+            loss = result["loss"] if isinstance(result, dict) else result
+            gathered_loss = self.accelerator.gather(loss).mean()
+            total_loss += gathered_loss.item()
+            num_steps += 1
+
+        avg_loss = total_loss / max(num_steps, 1)
+        self.accelerator.log({"val/loss": avg_loss}, step=self.global_step)
+
+        return {"val_loss": avg_loss}
+
+    # --- Checkpointing ---
+
+    def _save_checkpoint(self, epoch: int, metric_value: float | None):
+        name = f"epoch{epoch:03d}_{self.run_id}"
+        path = self.checkpoint_dir / name
+
+        self.accelerator.save_state(str(path))
+
+        if self.accelerator.is_main_process:
+            metadata = {
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "run_id": self.run_id,
+                "metric": self.cfg.checkpointing.val_metric,
+                "metric_value": metric_value,
+                "date": datetime.now().isoformat(),
+            }
+            (path / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+            if metric_value is not None and self._metric_is_better(metric_value, self.best_metric):
+                self.best_metric = metric_value
+
+                best_path = self.checkpoint_dir / "best"
+                if best_path.exists():
+                    import shutil
+                    shutil.rmtree(best_path)
+                self._copy_checkpoint(path, best_path)
+                log.info(f"New best: {self.cfg.checkpointing.val_metric}={metric_value:.4f}")
+
+            self._prune_checkpoints()
+
+        self._fire("on_checkpoint_saved", path=path)
+        log.info(f"Checkpoint saved: {path}")
+
+    @staticmethod
+    def _copy_checkpoint(src: Path, dst: Path):
+        """Copy a checkpoint directory without copying file/dir permissions.
+
+        Some NAS filesystems reject permission changes, so we
+        use copyfile (data only, no mode bits) instead of copy/copy2.
+        """
+        dst.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for item in src.iterdir():
+            if item.is_file():
+                shutil.copyfile(item, dst / item.name)
+            elif item.is_dir():
+                Trainer._copy_checkpoint(item, dst / item.name)
+
+    def _prune_checkpoints(self):
+        c = self.cfg.checkpointing
+        keep_top_k = c.get("keep_top_k", 3)
+        is_min = c.get("val_metric_mode", "min") == "min"
+
+        checkpoints = []
+        for p in self.checkpoint_dir.iterdir():
+            meta_file = p / "metadata.json"
+            if p.is_dir() and p.name.startswith("epoch") and meta_file.exists():
+                meta = json.loads(meta_file.read_text())
+                checkpoints.append((meta.get("metric_value", float("inf")), p))
+
+        if len(checkpoints) <= keep_top_k:
+            return
+
+        # Sort: best first (lowest for min, highest for max)
+        checkpoints.sort(key=lambda x: x[0] if x[0] is not None else float("inf"), reverse=not is_min)
+        to_remove = checkpoints[keep_top_k:]
+
+        import shutil
+
+        for _, path in to_remove:
+            shutil.rmtree(path)
+            log.info(f"Pruned checkpoint: {path.name}")
+
+    def _find_latest_checkpoint(self) -> Path | None:
+        if not self.checkpoint_dir.exists():
+            return None
+        checkpoints = sorted(
+            [p for p in self.checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith("epoch")],
+            key=lambda p: p.stat().st_mtime,
+        )
+        return checkpoints[-1] if checkpoints else None
+
+    def _load_checkpoint(self, path: Path):
+        log.info(f"Resuming from {path}")
+        self.accelerator.load_state(str(path))
+
+        meta_file = path / "metadata.json"
+        if meta_file.exists():
+            meta = json.loads(meta_file.read_text())
+            self.start_epoch = meta.get("epoch", 0) + 1
+            self.global_step = meta.get("global_step", 0)
+            self.run_id = meta.get("run_id", self.run_id)
+            val = meta.get("metric_value")
+            if val is not None:
+                self.best_metric = val
+            log.info(f"Resumed at epoch {self.start_epoch}, step {self.global_step}, run {self.run_id}")
+
+    def _handle_preemption(self, signum, frame):
+        log.warning("SLURM preemption signal received, saving checkpoint...")
+        self._save_checkpoint(self.current_epoch, None)
+        log.info("Checkpoint saved, exiting.")
+        sys.exit(0)
+
+    # --- Metrics ---
+
+    def _log_epoch_metrics(self, metrics: dict):
+        if not self.accelerator.is_main_process:
+            return
+
+        metrics_path = self.output_dir / "metrics.jsonl"
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps({"run_id": self.run_id, **metrics}) + "\n")
+
+        log.info(
+            f"Epoch {metrics['epoch']}: "
+            + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items() if k != "epoch" and isinstance(v, float))
+        )

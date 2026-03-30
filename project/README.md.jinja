@@ -1,0 +1,75 @@
+# {{ project_name }}
+
+{{ description }}
+
+New here? Start with the tutorial in the [ml-template](https://github.com/SanderMoon/ml-template) repo (`docs/tutorial.md`).
+
+## Setup
+
+```bash
+source .venv/bin/activate
+make install
+make test
+```
+
+## Quick start
+
+```bash
+# Run the example task to verify everything works (~30 seconds)
+make preprocess PREPROCESS_ARGS="task=example"
+make train TRAIN_ARGS="task=example training.epochs=5"
+make eval EVAL_ARGS="task=example"
+
+# Then create your own task (copy the example as a starting point)
+cp experiments/tasks/example.py experiments/tasks/my_task.py
+# Edit my_task.py, then run with: make train TRAIN_ARGS="task=my_task"
+```
+
+## Project structure
+
+```
+src/{{ project_slug }}/                    experiments/
+(library — pip install)                (pipeline — not distributed)
+─────────────────────                  ────────────────────────────
+models/                                tasks/
+  └── your model architectures           └── example.py (copy as starting point)
+data/                                        ├── preprocess()
+  └── datasets, transforms, collators       ├── build_dataloader()
+utils.py                                    ├── build_model()
+                                             ├── make_compute_loss()
+                                             ├── make_evaluate()
+                                             └── make_test_evaluate()
+                                       train.py (dispatcher)
+                                       trainer.py (Accelerate, checkpoints, logging)
+                                       eval.py (checkpoint loading, fold aggregation)
+                                       preprocess.py (config hashing, skip-if-exists)
+
+configs/config.yaml                    Makefile (all commands)
+configs/experiment/*.yaml              scripts/slurm/ (job submission)
+```
+
+## Common commands
+
+```bash
+# Local
+make train TRAIN_ARGS="training.lr=0.01"
+make train TRAIN_ARGS="+experiment=my_experiment"
+
+# Cluster
+make submit                              # sync + submit to {{ default_tier }}-VRAM tier
+make submit TIER=high                    # high-VRAM GPUs
+make sweep SWEEP="training.lr=0.001,0.01,0.1"
+make status                              # check jobs
+make logs                                # tail latest output
+```
+
+## Documentation
+
+Full documentation lives in the [ml-template](https://github.com/SanderMoon/ml-template) repo under `docs/`:
+
+- **tutorial.md** — getting started, what to change, what not to change
+- **advanced.md** — cross-validation, custom optimizers, GANs, eval callbacks
+- **commands.md** — full Makefile reference, GPU tiers, Docker, data manifest
+- **troubleshooting.md** — common failures, NAS quirks
+
+For coding agents: development conventions and the full task interface (including optional overrides) are documented in `CLAUDE.md` in this repo.

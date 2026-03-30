@@ -1,0 +1,25 @@
+# Data manifest — declare dataset dependencies here.
+#
+# Reference in configs via ${data:name} resolver:
+#   data:
+#     feature_dir: ${data:my_features}
+#
+# Types:
+#   external  — data managed outside this project (someone else's output)
+#   local     — data managed by this project (inside data/raw/)
+#
+# Examples:
+#
+# datasets:
+#   slide_features:
+#     type: external
+#     source: /data/shared/features/uni_v1
+#     owner: alice
+#     description: UNI features extracted per slide
+#
+#   labels:
+#     type: local
+#     path: labels/annotations_v2.csv
+#     description: Expert annotations (train/val/test splits)
+
+datasets: {}

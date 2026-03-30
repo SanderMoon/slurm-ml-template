@@ -1,0 +1,405 @@
+# =============================================================================
+# {{ project_name }}
+# =============================================================================
+#
+# Local:
+#   make install                    → editable install with dev deps
+#   make train                      → run training locally
+#   make eval                       → run evaluation locally
+#   make test                       → run tests
+#   make lock                       → pin dependencies to requirements.lock
+#
+# Config (Hydra):
+#   make train TRAIN_ARGS="+experiment=my_exp"            → experiment overlay
+#   make train TRAIN_ARGS="training.lr=0.01"              → CLI override
+#   make train TRAIN_ARGS="--multirun training.lr=0.001,0.01,0.1"  → sweep
+#
+# Cluster submission:
+#   make submit                     → sync + submit to default tier ({{ default_tier }})
+#   make submit TIER=high           → sync + submit to high-VRAM nodes
+#   make submit TIER=low GRES=gpu:2 → override any SLURM param
+#
+# Sweeps:
+#   make sweep SWEEP="training.lr=0.001,0.01,0.1"                → single-param sweep
+#   make sweep SWEEP="training.lr=0.001,0.01 training.epochs=50,100"  → grid sweep
+#
+# Dev sessions:
+#   make dev                        → sync + launch dev session
+#   make dev TIER=high              → dev session on high-VRAM node
+#
+# Data management:
+#   make snapshot NAME=x            → hardlink-copy external dataset (with confirmation)
+#   make init-nas                   → create project folders on NAS
+#
+# Monitoring:
+#   make status                     → show your SLURM jobs
+#   make logs                       → tail latest job output
+#   make cancel                     → cancel most recent job (with confirmation)
+# =============================================================================
+
+-include .env
+
+# --- Defaults (override in .env or on CLI) ---
+PROJECT_SLUG    ?= {{ project_slug }}
+REMOTE_HOST     ?= {{ remote_host }}
+DOCKER_IMAGE    ?= {{ docker_registry }}/{{ docker_namespace }}/{{ project_slug }}:latest
+DOCKER_BASE     ?= {{ base_docker_image }}
+DOCKER_REGISTRY ?= {{ docker_registry }}
+DOCKER_NS       ?= {{ docker_namespace }}
+
+# --- NAS paths ---
+NAS_BASE        ?= {{ nas_base_path }}
+NAS_PATH        ?= $(NAS_BASE)/$(PROJECT_SLUG)
+NAS_CODE        ?= $(NAS_PATH)/code
+NAS_DATA        ?= $(NAS_PATH)/data
+NAS_CHECKPOINTS ?= $(NAS_PATH)/checkpoints
+NAS_OUTPUTS     ?= $(NAS_PATH)/outputs
+NAS_LOGS        ?= $(NAS_PATH)/logs
+CONTAINER_MOUNTS ?= {% for p in container_mounts.split(',') %}{% if p.strip() %}{{ p.strip() }}:{{ p.strip() }}{% if not loop.last %},{% endif %}{% endif %}{% endfor %}
+
+# Local NAS mount (macOS)
+NAS_MOUNT       ?= {{ nas_mount_path }}
+LOCAL_NAS_PATH  ?= $(NAS_MOUNT)/$(PROJECT_SLUG)
+
+# --- Tier config (override with TIER=xxx or individual vars) ---
+TIER     ?= {{ default_tier }}
+QOS      ?= {{ default_qos }}
+NODELIST ?=
+GRES     ?=
+CPUS     ?=
+MEM      ?=
+TIME     ?=
+STAGE_DATA ?= 0
+
+# Load tier defaults, then let CLI vars take precedence
+_tier_config := $(wildcard configs/nodes/$(TIER).sh)
+ifneq ($(_tier_config),)
+  include configs/nodes/$(TIER).sh
+endif
+
+PREPROCESS_ARGS ?=
+TRAIN_ARGS ?=
+EVAL_ARGS  ?=
+SLURM_MAIL ?=
+SBATCH_MAIL_ARGS := $(if $(SLURM_MAIL),--mail-user=$(SLURM_MAIL),)
+
+SWEEP ?=
+
+.PHONY: help install preprocess train eval test lint format lock sync submit-preprocess submit submit-eval sweep sweep-eval sweep-results dev logs logs-all status cancel gpu-status build push clean doctor init-nas snapshot copy-data
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+
+# =============================================================================
+# Local development
+# =============================================================================
+
+install: ## Install project in editable mode with dev deps
+	uv pip install -e ".[pipeline,dev]"
+
+preprocess: ## Run preprocessing locally
+	python -m experiments.preprocess $(PREPROCESS_ARGS)
+
+train: ## Run training locally
+	python -m experiments.train $(TRAIN_ARGS)
+
+eval: ## Run evaluation locally
+	python -m experiments.eval $(EVAL_ARGS)
+
+test: ## Run tests
+	pytest tests/ -v
+
+lint: ## Run linter
+	ruff check src/ experiments/ tests/
+	ruff format --check src/ experiments/ tests/
+
+format: ## Auto-format code
+	ruff format src/ experiments/ tests/
+	ruff check --fix src/ experiments/ tests/
+
+lock: ## Pin dependencies to requirements.lock for reproducible installs
+	uv pip freeze --exclude-editable > requirements.lock
+	@echo "✓ Pinned $$(wc -l < requirements.lock | tr -d ' ') packages to requirements.lock"
+
+# =============================================================================
+# NAS / data management
+# =============================================================================
+
+init-nas: ## Create project folder structure on NAS
+	@if [ -d "$(NAS_MOUNT)" ]; then \
+		mkdir -p "$(LOCAL_NAS_PATH)/data/raw" \
+		         "$(LOCAL_NAS_PATH)/data/processed" \
+		         "$(LOCAL_NAS_PATH)/checkpoints" \
+		         "$(LOCAL_NAS_PATH)/outputs" \
+		         "$(LOCAL_NAS_PATH)/logs" \
+		         "$(LOCAL_NAS_PATH)/code"; \
+		echo "✓ Created $(LOCAL_NAS_PATH)/{data/{raw,processed},checkpoints,outputs,logs,code}"; \
+	else \
+		echo "NAS not mounted at $(NAS_MOUNT)"; \
+		echo "Creating via SSH..."; \
+		ssh $(REMOTE_HOST) "mkdir -p \
+			$(NAS_PATH)/data/raw \
+			$(NAS_PATH)/data/processed \
+			$(NAS_PATH)/checkpoints \
+			$(NAS_PATH)/outputs \
+			$(NAS_PATH)/logs \
+			$(NAS_PATH)/code"; \
+		echo "✓ Created $(NAS_PATH)/{data/{raw,processed},checkpoints,outputs,logs,code}"; \
+	fi
+
+snapshot: ## Hardlink-copy an external dataset from manifest (NAME=dataset_name)
+ifndef NAME
+	$(error NAME is required — e.g., make snapshot NAME=my_dataset)
+endif
+	@TIMESTAMP=$$(date +%Y%m%d) && \
+	SNAP_NAME="$(NAME)_$${TIMESTAMP}" && \
+	SRC=$$(python3 -c "import yaml; m=yaml.safe_load(open('configs/datasets.yaml')); d=m['datasets']['$(NAME)']; assert d['type']=='external', 'Only external datasets can be snapshotted'; print(d['source'])") && \
+	echo "" && \
+	echo "  This will hardlink-copy:" && \
+	echo "    FROM: $$SRC" && \
+	echo "    TO:   $(NAS_DATA)/snapshots/$${SNAP_NAME}/" && \
+	echo "" && \
+	read -p "  Proceed? [y/N] " confirm && \
+	[ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ] || { echo "Aborted."; exit 1; } && \
+	ssh $(REMOTE_HOST) "mkdir -p $(NAS_DATA)/snapshots/$${SNAP_NAME} && cp -al $$SRC/. $(NAS_DATA)/snapshots/$${SNAP_NAME}/ && echo '✓ Hardlinked $$SRC → $(NAS_DATA)/snapshots/$${SNAP_NAME}/'" && \
+	echo "" && \
+	echo "To use the snapshot, add to configs/datasets.yaml under the '$(NAME)' entry:" && \
+	echo "    snapshot: snapshots/$${SNAP_NAME}"
+
+copy-data: ## Full copy of a dataset into data/raw/ (SRC=/path/to/data NAME=dataset_name)
+ifndef SRC
+	$(error SRC is required)
+endif
+ifndef NAME
+	$(error NAME is required)
+endif
+	@echo ""
+	@echo "  This will COPY (not hardlink):"
+	@echo "    FROM: $(SRC)"
+	@echo "    TO:   $(NAS_DATA)/raw/$(NAME)/"
+	@echo "  This may use significant disk space."
+	@echo ""
+	@read -p "  Proceed? [y/N] " confirm && \
+	[ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ] || { echo "Aborted."; exit 1; }
+	@ssh $(REMOTE_HOST) "mkdir -p $(NAS_DATA)/raw/$(NAME) && rsync -avP $(SRC)/ $(NAS_DATA)/raw/$(NAME)/"
+
+# =============================================================================
+# Code sync
+# =============================================================================
+
+sync: ## Rsync code to NAS
+	@if [ -d "$(NAS_MOUNT)" ]; then \
+		echo "Syncing to $(LOCAL_NAS_PATH)/code/ (local mount)..."; \
+		rsync -avz --delete --exclude-from=.syncignore . "$(LOCAL_NAS_PATH)/code/"; \
+	else \
+		echo "Syncing to $(NAS_CODE) (via SSH)..."; \
+		rsync -avz --delete --exclude-from=.syncignore -e ssh . "$(REMOTE_HOST):$(NAS_CODE)/"; \
+	fi
+	@echo "Done."
+
+# =============================================================================
+# Cluster: training jobs
+# =============================================================================
+
+PREPROCESS_GRES ?=
+
+define sbatch_preprocess_cmd
+ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
+	--job-name=prep-$(PROJECT_SLUG) \
+	--nodes=1 \
+	--nodelist=$(NODELIST) \
+	$(if $(PREPROCESS_GRES),--gres=$(PREPROCESS_GRES),) \
+	--cpus-per-task=$(CPUS) \
+	--mem=$(MEM) \
+	--time=$(TIME) \
+	--qos=$(QOS) \
+	$(SBATCH_MAIL_ARGS) \
+	--container-image=$(DOCKER_IMAGE) \
+	--container-mounts=$(CONTAINER_MOUNTS) \
+	--container-workdir=$(NAS_CODE) \
+	--export=ALL,NAS_PATH=$(NAS_PATH),NAS_DATA=$(NAS_DATA),PREPROCESS_ARGS='$(1)' \
+	scripts/slurm/preprocess.sbatch"
+endef
+
+submit-preprocess: sync ## Sync + submit preprocessing job (CPU-only, add PREPROCESS_GRES=gpu:1 for GPU)
+	$(call sbatch_preprocess_cmd,$(PREPROCESS_ARGS))
+
+define sbatch_cmd
+ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
+	--job-name=$(PROJECT_SLUG) \
+	--nodes=1 \
+	--nodelist=$(NODELIST) \
+	--gres=$(GRES) \
+	--cpus-per-task=$(CPUS) \
+	--mem=$(MEM) \
+	--time=$(TIME) \
+	--qos=$(QOS) \
+	$(SBATCH_MAIL_ARGS) \
+	--container-image=$(DOCKER_IMAGE) \
+	--container-mounts=$(CONTAINER_MOUNTS) \
+	--container-workdir=$(NAS_CODE) \
+	--export=ALL,NAS_PATH=$(NAS_PATH),NAS_DATA=$(NAS_DATA),NAS_CHECKPOINTS=$(NAS_CHECKPOINTS),NAS_OUTPUTS=$(NAS_OUTPUTS),TRAIN_ARGS='$(1)',STAGE_DATA=$(STAGE_DATA) \
+	scripts/slurm/train.sbatch"
+endef
+
+submit: sync ## Sync + submit training job (TIER=high GRES=gpu:2 MEM=64G ...)
+	$(call sbatch_cmd,$(TRAIN_ARGS))
+
+sweep: sync ## Submit a parameter sweep (SWEEP="training.lr=0.001,0.01,0.1 training.epochs=50,100")
+ifndef SWEEP
+	$(error SWEEP is required — e.g., make sweep SWEEP="training.lr=0.001,0.01,0.1")
+endif
+	@python3 -c "\
+import itertools, sys; \
+params = '$(SWEEP)'.split(); \
+names, vals = zip(*[p.split('=') for p in params]); \
+grid = list(itertools.product(*[v.split(',') for v in vals])); \
+print(f'Submitting {len(grid)} jobs...', file=sys.stderr); \
+[print(' '.join(f'{n}={v}' for n, v in zip(names, combo))) for combo in grid]" | while read -r overrides; do \
+		echo "  → $$overrides"; \
+		$(call sbatch_cmd,$$overrides $(TRAIN_ARGS)); \
+	done
+
+SWEEP_DIR ?= outputs
+
+SWEEP_RESULTS_ARGS ?=
+
+sweep-results: ## Compare sweep runs (SWEEP_DIR=outputs/sweep, add --eval for eval metrics)
+	@python3 scripts/sweep_results.py "$(SWEEP_DIR)" $(SWEEP_RESULTS_ARGS)
+
+define sbatch_eval_cmd
+ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
+	--job-name=eval-$(PROJECT_SLUG) \
+	--nodes=1 \
+	--nodelist=$(NODELIST) \
+	--gres=$(GRES) \
+	--cpus-per-task=$(CPUS) \
+	--mem=$(MEM) \
+	--time=$(TIME) \
+	--qos=$(QOS) \
+	$(SBATCH_MAIL_ARGS) \
+	--container-image=$(DOCKER_IMAGE) \
+	--container-mounts=$(CONTAINER_MOUNTS) \
+	--container-workdir=$(NAS_CODE) \
+	--export=ALL,NAS_PATH=$(NAS_PATH),NAS_DATA=$(NAS_DATA),NAS_CHECKPOINTS=$(NAS_CHECKPOINTS),NAS_OUTPUTS=$(NAS_OUTPUTS),EVAL_ARGS='$(1)',STAGE_DATA=$(STAGE_DATA) \
+	scripts/slurm/eval.sbatch"
+endef
+
+submit-eval: sync ## Sync + submit evaluation job (TIER=medium ...)
+	$(call sbatch_eval_cmd,$(EVAL_ARGS))
+
+sweep-eval: sync ## Submit eval for each sweep combination (SWEEP=same as training, EVAL_ARGS for extras)
+ifndef SWEEP
+	$(error SWEEP is required — same value used for make sweep)
+endif
+	@python3 -c "\
+import itertools, sys; \
+params = '$(SWEEP)'.split(); \
+names, vals = zip(*[p.split('=') for p in params]); \
+grid = list(itertools.product(*[v.split(',') for v in vals])); \
+print(f'Submitting {len(grid)} eval jobs...', file=sys.stderr); \
+[print(' '.join(f'{n}={v}' for n, v in zip(names, combo))) for combo in grid]" | while read -r overrides; do \
+		echo "  → eval $$overrides"; \
+		$(call sbatch_eval_cmd,$$overrides $(EVAL_ARGS)); \
+	done
+
+# =============================================================================
+# Cluster: dev sessions
+# =============================================================================
+
+dev: sync ## Sync + launch interactive dev session (TIER=high ...)
+	ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
+		--job-name=dev-$(PROJECT_SLUG) \
+		--nodes=1 \
+		--nodelist=$(NODELIST) \
+		--gres=$(GRES) \
+		--cpus-per-task=$(CPUS) \
+		--mem=$(MEM) \
+		--time=12:00:00 \
+		--qos=$(QOS) \
+		--container-image=$(DOCKER_IMAGE) \
+		--container-mounts=$(CONTAINER_MOUNTS) \
+		--container-workdir=$(NAS_CODE) \
+		--export=ALL,NAS_PATH=$(NAS_PATH),NAS_DATA=$(NAS_DATA),NAS_CHECKPOINTS=$(NAS_CHECKPOINTS),NAS_OUTPUTS=$(NAS_OUTPUTS) \
+		scripts/slurm/dev.sbatch"
+
+# =============================================================================
+# Monitoring
+# =============================================================================
+
+logs: ## Tail SLURM job output (JOB=id for specific job, default: latest)
+	@if [ -d "$(NAS_MOUNT)" ]; then \
+		JOB=$${JOB:-$$(ls "$(LOCAL_NAS_PATH)/code/logs/slurm-"*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)}; \
+		echo "=== Job $${JOB} ===" && \
+		tail -f "$(LOCAL_NAS_PATH)/code/logs/slurm-$${JOB}.out" "$(LOCAL_NAS_PATH)/code/logs/slurm-$${JOB}.err"; \
+	else \
+		ssh $(REMOTE_HOST) "JOB=$${JOB:-\$$(ls $(NAS_CODE)/logs/slurm-*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)} && echo '=== Job \$${JOB} ===' && tail -f $(NAS_CODE)/logs/slurm-\$${JOB}.out $(NAS_CODE)/logs/slurm-\$${JOB}.err"; \
+	fi
+
+logs-all: ## Tail all running SLURM job outputs
+	@JOBS=$$(ssh $(REMOTE_HOST) "squeue -u \$$USER -h -o '%i'" 2>/dev/null); \
+	if [ -z "$$JOBS" ]; then echo "No running jobs."; exit 0; fi; \
+	FILES=""; \
+	for JOB in $$JOBS; do \
+		FILES="$$FILES $(NAS_CODE)/logs/slurm-$${JOB}.out $(NAS_CODE)/logs/slurm-$${JOB}.err"; \
+	done; \
+	if [ -d "$(NAS_MOUNT)" ]; then \
+		tail -f $$(echo "$$FILES" | sed "s|$(NAS_CODE)|$(LOCAL_NAS_PATH)/code|g"); \
+	else \
+		ssh $(REMOTE_HOST) "tail -f $$FILES"; \
+	fi
+
+status: ## Show your SLURM jobs
+	@ssh $(REMOTE_HOST) "squeue -u \$$USER -o '%.10i %.20j %.8T %.10M %.6D %.4C %.10m %R'"
+
+cancel: ## Cancel most recent job (with confirmation)
+	@JOB=$$(ssh $(REMOTE_HOST) "squeue -u \$$USER -h -o '%i %j %T' | head -1") && \
+	echo "  Cancel job: $$JOB" && \
+	read -p "  Proceed? [y/N] " confirm && \
+	[ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ] || { echo "Aborted."; exit 1; } && \
+	JOB_ID=$$(echo "$$JOB" | awk '{print $$1}') && \
+	ssh $(REMOTE_HOST) "scancel $$JOB_ID" && \
+	echo "  Cancelled."
+
+gpu-status: ## Check GPU availability across cluster
+	@ssh $(REMOTE_HOST) "sinfo -N -l --partition=gpu"
+
+# =============================================================================
+# Environment check
+# =============================================================================
+
+doctor: ## Check that all prerequisites are working
+	@echo "Checking environment..."
+	@echo ""
+	@printf "  %-30s" "Python" && python3 --version 2>/dev/null && echo "" || echo "✗ not found"
+	@printf "  %-30s" "uv" && uv --version 2>/dev/null || echo "✗ not found"
+	@printf "  %-30s" "Project importable" && python3 -c "import $(PROJECT_SLUG)" 2>/dev/null && echo "✓" || echo "✗ run make install"
+	@printf "  %-30s" "SSH to cluster" && ssh -o ConnectTimeout=5 $(REMOTE_HOST) "echo ✓" 2>/dev/null || echo "✗ check SSH config for $(REMOTE_HOST)"
+	@printf "  %-30s" "NAS mounted" && ([ -d "$(NAS_MOUNT)" ] && echo "✓ $(NAS_MOUNT)") || echo "✗ NAS not mounted at $(NAS_MOUNT)"
+	@printf "  %-30s" "NAS project dir" && ([ -d "$(LOCAL_NAS_PATH)" ] && echo "✓") || echo "✗ run make init-nas"
+	@printf "  %-30s" "Docker image" && ssh -o ConnectTimeout=5 $(REMOTE_HOST) "srun --gres= --container-image=$(DOCKER_IMAGE) --no-container-entrypoint echo ✓" 2>/dev/null || echo "✗ run make push (or check registry)"
+	@echo ""
+
+# =============================================================================
+# Docker
+# =============================================================================
+
+build: ## Build project Docker image
+	docker build --platform linux/amd64 \
+		-t $(PROJECT_SLUG):latest \
+		-t $(DOCKER_REGISTRY)/$(DOCKER_NS)/$(PROJECT_SLUG):latest \
+		-f scripts/docker/Dockerfile .
+
+push: build ## Build + push project Docker image
+	docker push $(DOCKER_REGISTRY)/$(DOCKER_NS)/$(PROJECT_SLUG):latest
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+clean: ## Remove local build artifacts, caches, outputs
+	rm -rf build/ dist/ *.egg-info src/*.egg-info
+	rm -rf outputs/ checkpoints/ logs/
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	@echo "✓ Cleaned local artifacts. NAS data untouched."

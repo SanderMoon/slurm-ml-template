@@ -1,0 +1,14 @@
+"""Training pipeline for {{ project_name }}.
+
+This package contains the training infrastructure (Trainer, Evaluator,
+preprocessing, config resolution). It is NOT distributed with the library —
+only the code in ``src/{{ project_slug }}/`` is published to PyPI.
+
+Modules:
+    train.py       — Training entrypoint (Hydra)
+    eval.py        — Evaluation entrypoint + Evaluator class
+    preprocess.py  — Preprocessing entrypoint
+    trainer.py     — Trainer class (Accelerate, checkpointing, logging)
+    config.py      — OmegaConf resolver registration
+    utils.py       — Pipeline utilities (config hashing)
+"""

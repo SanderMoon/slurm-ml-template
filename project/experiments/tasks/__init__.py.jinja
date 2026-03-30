@@ -1,0 +1,32 @@
+"""Task modules for {{ project_name }}.
+
+Each task is a Python module with a standard interface. train.py and
+eval.py load the task based on the ``task`` config key and assemble
+the Trainer/Evaluator automatically.
+
+Required (preprocessing):
+    preprocess(cfg) -> None                  # raw data → processed data
+
+Required (training + eval):
+    build_dataloader(cfg, split="train", fold=None) -> DataLoader
+    build_model(cfg) -> nn.Module
+
+Required (training):
+    make_compute_loss(cfg) -> Callable[[nn.Module, batch], Tensor]
+    make_evaluate(cfg) -> Callable           # train-time validation (fast)
+
+Required (eval):
+    make_test_evaluate(cfg) -> Callable      # post-training eval (thorough)
+
+Optional overrides:
+    build_optimizer(model, cfg) -> Optimizer       # default: AdamW
+    build_scheduler(optimizer, cfg) -> LRScheduler # default: cosine + warmup
+    build_eval_callbacks(cfg) -> list[EvalCallback]
+    on_complete(cfg, fold_results) -> None         # sequential CV post-hook
+    run(cfg) -> None                               # full training loop override
+    evaluate(cfg) -> None                          # full eval loop override
+
+Usage:
+    make train TRAIN_ARGS="task=example training.epochs=5"
+    make eval EVAL_ARGS="task=example"
+"""

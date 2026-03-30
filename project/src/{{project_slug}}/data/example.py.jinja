@@ -1,0 +1,33 @@
+"""Example data utilities.
+
+Demonstrates what belongs in the library's data module: a dataset class that
+encodes how the model expects to receive data. The dataset itself is generic
+(loads tensors from a directory) — it doesn't know about specific datasets,
+split strategies, or config paths. That wiring lives in the task.
+"""
+
+from pathlib import Path
+
+import torch
+from torch.utils.data import Dataset
+
+
+class TensorDirDataset(Dataset):
+    """Dataset that loads pre-saved tensor data from a directory.
+
+    Expects a ``data.pt`` file containing a dict with ``"X"`` and ``"y"`` keys.
+
+    Args:
+        data_dir: Path to directory containing ``data.pt``.
+    """
+
+    def __init__(self, data_dir: str | Path):
+        data = torch.load(Path(data_dir) / "data.pt", weights_only=True)
+        self.X = data["X"]
+        self.y = data["y"]
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"input": self.X[idx], "target": self.y[idx]}

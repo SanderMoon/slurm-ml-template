@@ -1,0 +1,137 @@
+_min_copier_version: "9.0.0"
+_subdirectory: project
+_answers_file: .copier-answers.yml
+
+
+# --- Project identity ---
+project_name:
+  type: str
+  help: Human-readable project name (e.g., "MIL Attention Baseline")
+
+project_slug:
+  type: str
+  help: Python package name (lowercase, underscores)
+  default: "{{ project_name | lower | replace(' ', '_') | replace('-', '_') }}"
+
+github_user:
+  type: str
+  help: GitHub username (for setting git remote)
+
+author:
+  type: str
+  help: Your name
+
+description:
+  type: str
+  help: One-line project description
+  default: ""
+
+# --- Python ---
+python_version:
+  type: str
+  help: Python version
+  default: "3.12"
+  choices:
+    - "3.10"
+    - "3.11"
+    - "3.12"
+
+# --- Infrastructure ---
+base_docker_image:
+  type: str
+  help: "Base Docker image for the project layer (should have PyTorch + common ML deps)"
+
+docker_registry:
+  type: str
+  help: "Docker registry for pushing project images (e.g. ghcr.io, registry.example.com:5005)"
+
+docker_namespace:
+  type: str
+  help: "Docker registry namespace (typically your username)"
+
+# --- Paths ---
+nas_base_path:
+  type: str
+  help: "Your personal project directory on shared storage (e.g. /data/projects/yourname)"
+
+nas_mount_path:
+  type: str
+  help: "Shared storage mount point on your laptop (e.g. /Volumes/data/yourname)"
+
+container_mounts:
+  type: str
+  help: "Comma-separated paths to bind-mount into containers (e.g. /data/projects,/data/archive)"
+  default: ""
+
+# --- Cluster ---
+remote_host:
+  type: str
+  help: "SSH alias for cluster login node (from your ~/.ssh/config)"
+
+nas_name:
+  type: str
+  help: "Name of your shared filesystem (for documentation)"
+  default: "NAS"
+
+slurm_mail_domain:
+  type: str
+  help: "Email domain for SLURM notifications (leave empty to skip)"
+  default: ""
+
+default_tier:
+  type: str
+  help: Default GPU tier for job submission
+  default: "medium"
+  choices:
+    - high
+    - medium
+    - low
+
+default_gpus:
+  type: int
+  help: Default number of GPUs
+  default: 1
+
+default_qos:
+  type: str
+  help: Default SLURM QoS
+  default: "high"
+  choices:
+    - low
+    - high
+
+# --- GPU tier node lists (optional — leave empty and fill in later) ---
+nodes_high:
+  type: str
+  help: "Comma-separated high-VRAM node names (optional, edit configs/nodes/high.sh later)"
+  default: ""
+
+nodes_medium:
+  type: str
+  help: "Comma-separated medium-VRAM node names (optional)"
+  default: ""
+
+nodes_low:
+  type: str
+  help: "Comma-separated low-VRAM node names (optional)"
+  default: ""
+
+# --- Features ---
+use_wandb:
+  type: bool
+  help: Include Weights & Biases integration
+  default: false
+
+use_github_actions:
+  type: bool
+  help: Include GitHub Actions CI/CD workflows
+  default: false
+
+
+# --- Post-creation tasks ---
+_tasks:
+  - command: "git init"
+  - command: "git remote add origin git@github.com:{{ github_user }}/{{ project_slug }}.git"
+  - command: "uv venv --python {{ python_version }} .venv || python{{ python_version }} -m venv .venv"
+  - command: "mkdir -p {{ nas_mount_path }}/{{ project_slug }}/data/raw {{ nas_mount_path }}/{{ project_slug }}/data/processed {{ nas_mount_path }}/{{ project_slug }}/checkpoints {{ nas_mount_path }}/{{ project_slug }}/outputs {{ nas_mount_path }}/{{ project_slug }}/logs {{ nas_mount_path }}/{{ project_slug }}/code 2>/dev/null && echo '✓ Created project folders on NAS' || echo '⚠ NAS not mounted — run: make init-nas'"
+  - command: "echo '\n✓ Project created: {{ project_name }}\n  1. source .venv/bin/activate\n  2. make install\n  3. make test\n  4. Start coding in src/{{ project_slug }}/\n'"

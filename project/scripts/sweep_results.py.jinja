@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Compare sweep runs by reading metrics and configs from output directories.
+
+Reads training metrics from metrics.jsonl and (optionally) eval metrics from
+eval_results.json. Prints a sorted comparison table.
+
+Usage:
+    python scripts/sweep_results.py outputs/sweep
+    python scripts/sweep_results.py outputs/sweep --metric val_loss --mode min
+    python scripts/sweep_results.py outputs/sweep --eval              # include eval metrics
+    python scripts/sweep_results.py outputs/sweep --eval --metric test_accuracy --mode max
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_best_metric(metrics_path: Path, metric: str, mode: str) -> tuple[float | None, int | None]:
+    """Read metrics.jsonl and return the best metric value and its epoch."""
+    best_val = None
+    best_epoch = None
+    is_better = (lambda a, b: a < b) if mode == "min" else (lambda a, b: a > b)
+
+    for line in metrics_path.read_text().strip().splitlines():
+        entry = json.loads(line)
+        val = entry.get(metric)
+        if val is not None and (best_val is None or is_better(val, best_val)):
+            best_val = val
+            best_epoch = entry.get("epoch")
+
+    return best_val, best_epoch
+
+
+def load_eval_metrics(eval_path: Path) -> dict[str, float]:
+    """Read eval_results.json and return the metrics dict."""
+    data = json.loads(eval_path.read_text())
+    # Single run: metrics at top level. CV: use aggregate.
+    if "aggregate" in data:
+        return data["aggregate"]
+    return data.get("metrics", {})
+
+
+def flatten_config(d: dict, prefix: str = "") -> dict:
+    """Flatten nested config to dot-notation."""
+    flat = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(flatten_config(v, f"{key}."))
+        else:
+            flat[key] = v
+    return flat
+
+
+def find_overrides(configs: list[dict]) -> dict[str, list]:
+    """Find config keys that differ across runs (the swept parameters)."""
+    if not configs:
+        return {}
+
+    flat_configs = [flatten_config(c) for c in configs]
+    all_keys = set()
+    for fc in flat_configs:
+        all_keys.update(fc.keys())
+
+    varying = {}
+    for key in sorted(all_keys):
+        values = [fc.get(key) for fc in flat_configs]
+        if len(set(str(v) for v in values)) > 1:
+            varying[key] = values
+
+    # Filter out path-like keys and hydra internals
+    varying = {k: v for k, v in varying.items()
+               if not k.startswith("paths.") and not k.startswith("hydra.")}
+
+    return varying
+
+
+def print_table(headers: list[str], rows: list[list[str]], best_idx: int = 0):
+    """Print a formatted table with a best-row marker."""
+    widths = [max(len(h), max((len(r[i]) for r in rows), default=0))
+              for i, h in enumerate(headers)]
+
+    header_line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+    print(f"\n  {header_line}")
+    print(f"  {'─' * len(header_line)}")
+
+    for i, row in enumerate(rows):
+        line = "  ".join(v.ljust(w) for v, w in zip(row, widths))
+        marker = " ← best" if i == best_idx else ""
+        print(f"  {line}{marker}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare sweep run results")
+    parser.add_argument("sweep_dir", type=Path, help="Path to sweep output directory")
+    parser.add_argument("--metric", default=None, help="Metric to compare (default: from config)")
+    parser.add_argument("--mode", default=None, choices=["min", "max"], help="Metric mode (default: from config)")
+    parser.add_argument("--eval", action="store_true", help="Include eval metrics from eval_results.json")
+    args = parser.parse_args()
+
+    if not args.sweep_dir.exists():
+        print(f"Directory not found: {args.sweep_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Discover runs
+    runs = []
+    for run_dir in sorted(args.sweep_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+
+        config_path = run_dir / "config.yaml"
+        metrics_path = run_dir / "metrics.jsonl"
+        eval_path = run_dir / "eval_results.json"
+
+        # Need at least one source of metrics
+        if not metrics_path.exists() and not (args.eval and eval_path.exists()):
+            continue
+
+        config = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        default_metric = config.get("checkpointing", {}).get("val_metric", "val_loss")
+        default_mode = config.get("checkpointing", {}).get("val_metric_mode", "min")
+
+        run = {"dir": run_dir.name, "config": config}
+
+        # Training metrics
+        if metrics_path.exists():
+            metric = args.metric or default_metric
+            mode = args.mode or default_mode
+            best_val, best_epoch = load_best_metric(metrics_path, metric, mode)
+            run["train_metric"] = metric
+            run["train_best"] = best_val
+            run["train_epoch"] = best_epoch
+
+        # Eval metrics
+        if args.eval and eval_path.exists():
+            eval_metrics = load_eval_metrics(eval_path)
+            run["eval_metrics"] = eval_metrics
+
+        runs.append(run)
+
+    if not runs:
+        print(f"No runs found in {args.sweep_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine sort metric and mode
+    if args.eval and runs[0].get("eval_metrics"):
+        # Sort by eval metric if available
+        eval_keys = list(runs[0]["eval_metrics"].keys())
+        sort_metric = args.metric or (eval_keys[0] if eval_keys else None)
+        sort_mode = args.mode or "min"
+        sort_key = lambda r: r.get("eval_metrics", {}).get(sort_metric, float("inf"))
+    else:
+        sort_metric = runs[0].get("train_metric", "val_loss")
+        sort_mode = args.mode or runs[0]["config"].get("checkpointing", {}).get("val_metric_mode", "min")
+        sort_key = lambda r: r.get("train_best") if r.get("train_best") is not None else float("inf")
+
+    runs.sort(key=sort_key, reverse=(sort_mode == "max"))
+
+    # Find varying config keys
+    varying = find_overrides([r["config"] for r in runs])
+    param_names = list(varying.keys())
+    configs_flat = [flatten_config(r["config"]) for r in runs]
+
+    # Build table
+    headers = list(param_names)
+    if runs[0].get("train_best") is not None:
+        headers += [f"best {runs[0]['train_metric']}", "epoch"]
+    if args.eval and runs[0].get("eval_metrics"):
+        headers += [f"eval:{k}" for k in runs[0]["eval_metrics"].keys()]
+    headers.append("dir")
+
+    rows = []
+    for i, run in enumerate(runs):
+        row = [str(configs_flat[i].get(key, "")) for key in param_names]
+        if run.get("train_best") is not None:
+            row.append(f"{run['train_best']:.4f}" if run["train_best"] is not None else "N/A")
+            row.append(str(run["train_epoch"]) if run["train_epoch"] is not None else "N/A")
+        if args.eval and run.get("eval_metrics"):
+            for k in runs[0]["eval_metrics"].keys():
+                v = run["eval_metrics"].get(k)
+                row.append(f"{v:.4f}" if v is not None else "N/A")
+        row.append(run["dir"])
+        rows.append(row)
+
+    print_table(headers, rows)
+    source = f"eval:{sort_metric}" if args.eval and runs[0].get("eval_metrics") else sort_metric
+    print(f"\n  {len(runs)} runs, sorted by {source} ({sort_mode})")
+
+    # Print best run's checkpoint path for easy copy-paste
+    best_run = runs[0]
+    best_config = best_run.get("config", {})
+    best_ckpt_dir = best_config.get("paths", {}).get("checkpoint_dir", "")
+    if best_ckpt_dir:
+        best_ckpt = Path(best_ckpt_dir) / "best"
+    else:
+        best_ckpt = args.sweep_dir.parent / "checkpoints" / best_run["dir"] / "best"
+    print(f"  Best run checkpoint: {best_ckpt}\n")
+
+
+if __name__ == "__main__":
+    main()

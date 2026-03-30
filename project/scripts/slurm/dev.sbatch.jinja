@@ -1,0 +1,77 @@
+#!/bin/bash
+# =============================================================================
+# Dev session — SLURM params injected via sbatch CLI flags from Makefile
+#
+# Environment variables (set by Makefile --export):
+#   NAS_PATH        — project root on NAS
+#   NAS_DATA        — data directory
+#   NAS_CHECKPOINTS — checkpoint directory
+#   NAS_OUTPUTS     — output directory
+# =============================================================================
+#SBATCH --output=logs/slurm-%j.out
+#SBATCH --error=logs/slurm-%j.err
+#SBATCH --open-mode=append
+#SBATCH --no-container-entrypoint
+
+set -euo pipefail
+
+PROJECT_SLUG="{{ project_slug }}"
+PORT=${PORT:-58888}
+
+echo "======================================================"
+echo " Dev Session:   $SLURM_JOB_ID"
+echo " Node:          $(hostname)"
+echo " GPUs:          $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+echo " Data:          ${NAS_DATA}"
+echo " Checkpoints:   ${NAS_CHECKPOINTS}"
+echo " Date:          $(date)"
+echo "======================================================"
+
+# --- Setup ---
+# All deps are pre-installed in the Docker image. Only need editable project link.
+export UV_CACHE_DIR="/tmp/uv-cache-${SLURM_JOB_ID}"
+VENV="/tmp/venv-${SLURM_JOB_ID}"
+uv venv --system-site-packages "${VENV}"
+source "${VENV}/bin/activate"
+uv pip install -e . --no-deps -q
+
+# --- Configure shell for SSH logins ---
+NODE_SHORT=$(hostname)
+cat >> /root/.bashrc <<EOF
+
+# --- dev-session auto-setup ---
+source "${VENV}/bin/activate"
+cd "$(pwd)" 2>/dev/null
+export NAS_PATH="${NAS_PATH}"
+export NAS_DATA="${NAS_DATA}"
+export NAS_CHECKPOINTS="${NAS_CHECKPOINTS}"
+export NAS_OUTPUTS="${NAS_OUTPUTS}"
+echo ""
+echo "  Dev Session | Job \$SLURM_JOB_ID | \$(hostname)"
+echo "  GPU:          \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo "  Code:         $(pwd)"
+echo "  Data:         ${NAS_DATA}"
+echo "  Checkpoints:  ${NAS_CHECKPOINTS}"
+echo ""
+EOF
+
+# --- Save connection info ---
+mkdir -p "${HOME}/connection-info"
+cat > "${HOME}/connection-info/${SLURM_JOB_ID}.txt" <<EOF
+Job:          ${SLURM_JOB_ID}
+Host:         $(hostname)
+SSH:          ssh ${NODE_SHORT} -A
+Code:         $(pwd)
+Data:         ${NAS_DATA}
+Checkpoints:  ${NAS_CHECKPOINTS}
+Started:      $(date)
+EOF
+
+echo ""
+echo "  SSH: ssh ${NODE_SHORT} -A"
+echo "  Info saved to ~/connection-info/${SLURM_JOB_ID}.txt"
+echo ""
+echo "Starting SSH daemon on port ${PORT}..."
+
+/usr/sbin/sshd -D -p ${PORT} &
+wait $!

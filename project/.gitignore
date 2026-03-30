@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.hydra/
+*.log
+
+# Project
+outputs/
+checkpoints/
+logs/
+/data/
+wandb/
+*.sqsh
+
+# Environment
+.env
+
+# Notebooks
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store

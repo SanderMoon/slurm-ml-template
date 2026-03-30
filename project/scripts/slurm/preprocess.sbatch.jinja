@@ -1,0 +1,45 @@
+#!/bin/bash
+# =============================================================================
+# Preprocessing job — CPU-only by default, override with GRES=gpu:1 for
+# GPU-based preprocessing (e.g., feature extraction with foundation models).
+#
+# Environment variables (set by Makefile --export):
+#   NAS_PATH        — project root on NAS
+#   NAS_DATA        — data directory
+#   NAS_OUTPUTS     — output directory (for logs)
+# =============================================================================
+#SBATCH --output=logs/slurm-%j.out
+#SBATCH --error=logs/slurm-%j.err
+#SBATCH --open-mode=append
+#SBATCH --mail-type=END,FAIL
+#SBATCH --no-container-entrypoint
+
+set -euo pipefail
+
+PROJECT_SLUG="{{ project_slug }}"
+
+echo "======================================================"
+echo " Preprocess Job: $SLURM_JOB_ID"
+echo " Node:           $(hostname)"
+echo " CPUs:           $SLURM_CPUS_PER_TASK"
+echo " Data:           ${NAS_DATA}"
+echo " Date:           $(date)"
+echo "======================================================"
+
+# --- Setup ---
+export UV_CACHE_DIR="/tmp/uv-cache-${SLURM_JOB_ID}"
+VENV="/tmp/venv-${SLURM_JOB_ID}"
+uv venv --system-site-packages "${VENV}"
+source "${VENV}/bin/activate"
+uv pip install -e . --no-deps -q
+
+mkdir -p "${NAS_DATA}/processed" logs
+
+# --- Preprocess ---
+export DATA_DIR="${NAS_DATA}"
+echo "Starting preprocessing..."
+python -m experiments.preprocess \
+    paths.data_dir="${NAS_DATA}" \
+    paths.processed_dir="${NAS_DATA}/processed" \
+    ${PREPROCESS_ARGS:-}
+echo "Done at $(date)"

@@ -1,0 +1,68 @@
+#!/bin/bash
+# =============================================================================
+# Evaluation job — SLURM params injected via sbatch CLI flags from Makefile
+#
+# Environment variables (set by Makefile --export):
+#   NAS_PATH        — project root on NAS
+#   NAS_DATA        — data directory (data/raw/, data/processed/)
+#   NAS_CHECKPOINTS — checkpoint directory
+#   NAS_OUTPUTS     — output directory
+# =============================================================================
+#SBATCH --output=logs/slurm-%j.out
+#SBATCH --error=logs/slurm-%j.err
+#SBATCH --open-mode=append
+#SBATCH --mail-type=END,FAIL
+#SBATCH --no-container-entrypoint
+
+set -euo pipefail
+
+PROJECT_SLUG="{{ project_slug }}"
+
+echo "======================================================"
+echo " Eval Job:     $SLURM_JOB_ID"
+echo " Node:         $(hostname)"
+echo " GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+echo " Data:         ${NAS_DATA}"
+echo " Checkpoints:  ${NAS_CHECKPOINTS}"
+echo " Outputs:      ${NAS_OUTPUTS}"
+echo " Date:         $(date)"
+echo "======================================================"
+
+# --- Setup ---
+export UV_CACHE_DIR="/tmp/uv-cache-${SLURM_JOB_ID}"
+VENV="/tmp/venv-${SLURM_JOB_ID}"
+uv venv --system-site-packages "${VENV}"
+source "${VENV}/bin/activate"
+uv pip install -e . --no-deps -q
+
+mkdir -p "${NAS_OUTPUTS}" logs
+
+# --- Distributed env (single-node) ---
+export WORLD_SIZE=1
+export RANK=0
+export LOCAL_RANK=0
+export MASTER_ADDR=localhost
+export MASTER_PORT=29500
+
+# --- Optional: stage data to node-local storage ---
+DATA_PATH="${NAS_DATA}"
+if [ "${STAGE_DATA:-0}" = "1" ]; then
+    LOCAL_DATA="/tmp/data-${SLURM_JOB_ID}"
+    echo "Staging data to ${LOCAL_DATA}..."
+    mkdir -p "${LOCAL_DATA}"
+    rsync -a --info=progress2 "${NAS_DATA}/" "${LOCAL_DATA}/"
+    trap 'echo "Cleaning up staged data..."; rm -rf "${LOCAL_DATA}"' EXIT
+    DATA_PATH="${LOCAL_DATA}"
+    echo "Staging complete ($(du -sh "${LOCAL_DATA}" | cut -f1))"
+fi
+
+# --- Evaluate ---
+export DATA_DIR="${DATA_PATH}"
+echo "Starting evaluation..."
+python -m experiments.eval \
+    paths.checkpoint_dir="${NAS_CHECKPOINTS}" \
+    paths.data_dir="${DATA_PATH}" \
+    paths.processed_dir="${DATA_PATH}/processed" \
+    paths.output_dir="${NAS_OUTPUTS}" \
+    ${EVAL_ARGS:-}
+echo "Done at $(date)"

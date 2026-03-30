@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "{{ project_slug }}"
+version = "0.1.0"
+description = "{{ description }}"
+readme = "README.md"
+requires-python = ">={{ python_version }}"
+authors = [{ name = "{{ author }}" }]
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+pipeline = [
+    "torchvision",
+    "numpy",
+    "accelerate",
+    "hydra-core>=1.3",
+    "tqdm",
+    "python-dotenv",
+    "wandb",
+    "tensorboard",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "debugpy",
+    "ipython",
+]
+
+[tool.hatch.build]
+packages = ["src/{{ project_slug }}", "experiments"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{{ project_slug }}"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py{{ python_version | replace('.', '') }}"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

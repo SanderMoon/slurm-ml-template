@@ -1,0 +1,100 @@
+# =============================================================================
+# {{ project_name }} — Default configuration
+#
+# All model parameters and training hyperparameters live here, not in code.
+# Override per-experiment with +experiment=name or bare key=value on the CLI.
+#
+# Usage:
+#   make train                                                   # uses this file
+#   make train TRAIN_ARGS="+experiment=my_experiment"             # experiment overlay
+#   make train TRAIN_ARGS="training.lr=0.01"                     # CLI override
+#   make train TRAIN_ARGS="--multirun training.lr=0.001,0.01,0.1"  # sweep
+# =============================================================================
+
+defaults:
+  - _self_
+
+# --- Task (which training pipeline to use) ---
+task: example
+
+# --- Paths (overridden by SLURM scripts for cluster runs) ---
+paths:
+  data_dir: data
+  processed_dir: data/processed     # preprocess output (hash-based subdirs)
+  checkpoint_dir: checkpoints
+  output_dir: outputs
+
+# Resume from a specific checkpoint (null = auto-resume from latest)
+resume_from: null
+
+model:
+  num_classes: 2
+  hidden_dim: 256
+  dropout: 0.25
+
+data:
+  num_workers: 4
+  batch_size: 32
+
+preprocess:
+  # Task-specific preprocessing keys live here. The framework doesn't
+  # interpret them — they're passed to task.preprocess(cfg).
+  # A config hash is computed from this section + paths.data_dir (not from
+  # data or training) to create a unique output directory under processed_dir.
+  #
+  # Example:
+  # patch_size: 256
+  # feature_extractor: resnet50
+  # num_folds: 5
+
+training:
+  seed: 42
+  epochs: 100
+  max_steps: null             # null = epoch-based; set for step-based training (e.g., 100000)
+  lr: 0.001
+  weight_decay: 0.0001
+  max_grad_norm: 1.0          # null to disable gradient clipping
+
+  early_stopping:
+    enabled: false
+    patience: 10              # number of validation checks without improvement
+    min_delta: 0.0            # minimum change to qualify as improvement
+
+checkpointing:
+  save_every_n_epochs: 5          # 0 to disable checkpointing (useful for sweeps)
+  validate_every_n_epochs: null   # null = same as save_every_n_epochs
+  save_every_n_steps: null        # step-based checkpointing (used with max_steps)
+  validate_every_n_steps: null    # step-based validation (used with max_steps)
+  keep_top_k: 3
+  val_metric: val_loss
+  val_metric_mode: min         # min or max (max for AUROC, min for loss)
+
+eval:
+  checkpoint: best              # best, latest, or explicit path
+  output_file: eval_results.json
+  # Override any config key at eval time. These are merged on top of the
+  # base config before building dataloaders/model. Useful when eval needs
+  # different settings than training (e.g., larger batch size, different
+  # data path, test-time augmentation flags).
+  #
+  # Example:
+  # overrides:
+  #   data.batch_size: 64
+  #   data.test_data_dir: ${data:test_features}
+  #   data.tta: true
+  overrides: {}
+
+logging:
+  log_every_n_steps: 10
+  use_wandb: {{ use_wandb | lower }}
+  wandb_project: {{ project_slug }}
+
+# --- Hydra settings ---
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  sweep:
+    dir: outputs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

@@ -1,0 +1,74 @@
+"""Configuration helpers for {{ project_name }}.
+
+Registers custom OmegaConf resolvers used by Hydra configs. Call
+``register_resolvers()`` before ``@hydra.main()`` runs.
+
+Dataset references use the ``${data:name}`` resolver syntax in YAML configs.
+The resolver loads ``configs/datasets.yaml`` and maps dataset names to paths.
+"""
+
+import logging
+import os
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+from omegaconf import OmegaConf
+
+log = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).parent.parent
+MANIFEST_PATH = PROJECT_ROOT / "configs" / "datasets.yaml"
+
+
+@lru_cache(maxsize=1)
+def _load_manifest() -> dict[str, str]:
+    """Load data manifest and resolve dataset names to absolute paths.
+
+    External datasets resolve to their source path (or snapshot if declared).
+    Local datasets resolve to ``DATA_DIR`` env var / path (or raw path as fallback).
+    """
+    if not MANIFEST_PATH.exists():
+        return {}
+
+    with open(MANIFEST_PATH) as f:
+        manifest = yaml.safe_load(f) or {}
+
+    datasets = manifest.get("datasets", {})
+    nas_data_dir = os.environ.get("DATA_DIR")
+    resolved: dict[str, str] = {}
+
+    for name, spec in datasets.items():
+        dtype = spec.get("type", "external")
+
+        if dtype == "local":
+            if nas_data_dir:
+                resolved[name] = str(Path(nas_data_dir) / spec["path"])
+            else:
+                resolved[name] = spec["path"]
+        elif dtype == "external":
+            snapshot_path = spec.get("snapshot")
+            if snapshot_path and nas_data_dir:
+                resolved[name] = str(Path(nas_data_dir) / snapshot_path)
+            else:
+                resolved[name] = spec["source"]
+
+    return resolved
+
+
+def _data_resolver(name: str) -> str:
+    """OmegaConf resolver: ``${data:name}`` -> resolved dataset path."""
+    datasets = _load_manifest()
+    if name not in datasets:
+        available = list(datasets.keys())
+        raise KeyError(
+            f"Dataset '{name}' referenced in config but not found in configs/datasets.yaml. "
+            f"Available: {available}"
+        )
+    return datasets[name]
+
+
+def register_resolvers() -> None:
+    """Register custom OmegaConf resolvers. Safe to call multiple times."""
+    if not OmegaConf.has_resolver("data"):
+        OmegaConf.register_new_resolver("data", _data_resolver)

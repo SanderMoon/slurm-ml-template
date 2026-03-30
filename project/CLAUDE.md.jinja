@@ -1,0 +1,379 @@
+# {{ project_name }}
+
+{{ description }}
+
+This project follows a standardized ML project template. The same structure, conventions, and
+patterns are used across all projects to enable consistency and future code reuse.
+
+## Stack
+
+- **PyTorch** with **HF Accelerate** for distributed training and mixed precision
+- **W&B** for experiment tracking (primary){%- if not use_wandb %} — enable by adding `wandb` to dependencies{%- endif %}
+- **TensorBoard** as fallback logging (stored in project outputs on NAS)
+- **tqdm** for progress bars
+- **python-dotenv** for environment variable loading (API keys, W&B tokens, etc.)
+- **pytest** for testing
+- **ruff** for formatting and linting
+- **Hydra** + **OmegaConf** for config management (composition, CLI overrides, sweeps)
+
+## Development principles
+
+### Config-driven development
+
+**All model parameters and training hyperparameters must live in YAML config files, never
+hardcoded in Python.** This is a hard rule.
+
+```
+configs/
+├── config.yaml               ← base config with all defaults (Hydra entrypoint)
+├── experiment/
+│   └── example.yaml          ← experiment overrides (only what differs)
+└── datasets.yaml             ← data manifest (user-created)
+```
+
+How it works:
+- `config.yaml` defines every parameter with sensible defaults
+- Experiment configs override what changes: `+experiment=my_exp`
+- CLI overrides for quick iteration: `training.lr=0.01` (bare key=value)
+- Parameter sweeps: `--multirun training.lr=0.001,0.01,0.1`
+- The resolved config is saved as `config.yaml` in the output dir for reproducibility
+- Dataset references: use `${data:name}` in configs to reference entries from `datasets.yaml`
+
+When adding a new parameter:
+1. Add it to the relevant section in `configs/config.yaml`
+2. Access it in code via `cfg.section.param` (dot notation)
+3. Never use magic numbers or hardcoded values in Python files
+
+```python
+# WRONG — hardcoded values
+model = MyModel(hidden_dim=256, dropout=0.25, num_heads=8)
+
+# RIGHT — config-driven
+model = MyModel(
+    hidden_dim=cfg.model.hidden_dim,
+    dropout=cfg.model.dropout,
+    num_heads=cfg.model.num_heads,
+)
+```
+
+Running experiments:
+```bash
+make train                                                        # default config
+make train TRAIN_ARGS="+experiment=my_experiment"                  # experiment overlay
+make train TRAIN_ARGS="training.lr=0.01 model.dropout=0.5"        # CLI overrides
+make train TRAIN_ARGS="--multirun training.lr=0.001,0.01,0.1"     # parameter sweep
+```
+
+### Test-driven development
+
+Write tests before or alongside implementation. Every module should have corresponding tests.
+This is non-negotiable — untested code is incomplete code.
+
+```bash
+make test                    # run all tests
+pytest tests/ -v             # verbose
+pytest tests/ -k "test_name" # specific test
+```
+
+### What to test
+
+- **Model correctness**: output shapes, gradient flow (`param.grad is not None` for all params),
+  determinism with fixed seeds, loss decreases on a tiny overfit set. These catch silent bugs
+  that produce wrong results without raising exceptions.
+- **Data pipeline**: transforms produce expected shapes/dtypes, loading a known sample returns
+  expected values, batching works correctly, lazy loading doesn't leak memory.
+- **Training integration**: a few training steps on synthetic data complete without error,
+  checkpointing + resume produces identical state, metrics are logged correctly.
+- **Unit tests**: standard input/output testing for utility functions.
+
+### Code quality
+
+- **Never use `print()` for logging.** Use Python's `logging` module or Accelerate's logger.
+- **Type hints** on all public function signatures.
+- **Format with `ruff format`**, lint with `ruff check`. Run `make lint` before committing.
+- **Build code as if it's a production package.** Clean imports, clear module boundaries,
+  no dead code.
+
+### Composability
+
+Design components with clear interfaces so they can be reused across projects:
+
+- Functions and classes should have well-defined inputs and outputs
+- Avoid hidden dependencies between modules
+- Prefer composition over inheritance
+- Keep model, data, training, and evaluation logic separate
+- Use dict returns from `__getitem__` (not tuples — they're fragile and unnamed)
+
+## Training conventions
+
+### Trainer class
+
+Use a `Trainer` class — not an inline training loop in `train.py`. This enables reuse and
+makes the training contract explicit.
+
+```python
+from experiments.trainer import Trainer
+
+# cfg is provided by Hydra via @hydra.main() decorator
+trainer = Trainer(
+    model=model,
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    cfg=cfg,
+)
+trainer.train()
+```
+
+The Trainer should handle:
+- HF Accelerate setup (device placement, mixed precision, distributed)
+- Training loop with gradient accumulation
+- Periodic validation (every N epochs)
+- Checkpointing (every N epochs, top-K by validation metric)
+- SLURM preemption (SIGUSR1 → checkpoint + graceful exit)
+- Logging to W&B + TensorBoard + JSON metrics file
+- Full reproducibility (seed everything)
+
+### Checkpointing
+
+- Save every N epochs (configurable)
+- Keep top-K checkpoints by validation metric
+- Checkpoint naming: `epoch{N:03d}_{YYYY-MM-DD}` — no metric values in filename
+- Metrics go in a separate JSON file per epoch alongside the checkpoint
+- Always save: model state, optimizer state, scheduler state, scaler state, epoch, step
+- Save the full training config/args alongside the run output
+- Write checkpoints to NAS (`$NAS_CHECKPOINTS`), never to node-local storage
+- Auto-resume: on start, find the latest checkpoint and continue from there
+
+### Reproducibility
+
+- **Always seed everything**: `torch.manual_seed`, `torch.cuda.manual_seed_all`,
+  `numpy.random.seed`, `random.seed`, and set `torch.backends.cudnn.deterministic = True`
+- Save the full config/args as JSON in the output directory at the start of each run
+- Log the git commit hash if available
+
+### Logging
+
+- **W&B** is the primary experiment tracker. Log per-step: loss, learning rate, grad norm.
+  Log per-epoch: validation metrics, epoch loss.
+- **TensorBoard** as fallback. Store in `$NAS_OUTPUTS/tensorboard/`.
+- **JSON metrics**: dump a `metrics.jsonl` file with one JSON object per epoch containing
+  all metrics and a pointer to the corresponding checkpoint path.
+- **Console**: use `tqdm` for progress bars, Python `logging` for status messages.
+  Never `print()`.
+
+### Preprocessing
+
+- Implement `preprocess(cfg)` in the task module. Reads from `cfg.paths.data_dir`,
+  writes to `cfg.paths.processed_dir` (config-hash-based, auto-resolved).
+- Task-specific parameters go in `cfg.preprocess`. The framework doesn't interpret them.
+- The framework handles skip-if-exists detection and config-hash-based output directories.
+- The contract between `preprocess` and `build_dataloader` is the filesystem — no Python API.
+- Raw data in `data/raw/` is never written to by code. Processed data lives in
+  `data/processed/<hash>/`.
+
+### Data loading
+
+- **Never load all data in memory.** Always lazy-load from disk (HDF5, memory-mapped files,
+  or on-demand file reads).
+- Use `num_workers > 0` with `pin_memory=True` for GPU preloading.
+- `__getitem__` should return a **dict** (not a tuple). Keys are self-documenting and
+  won't break when you add/remove fields.
+- `build_dataloader` reads from `cfg.paths.processed_dir` (preprocessed data) or
+  `cfg.paths.data_dir` (raw data, for tasks without preprocessing).
+- The framework calls `build_dataloader` with `split="train"`, `"val"`, or `"test"`.
+  If your data uses different names (e.g. "tune" instead of "val"), map them
+  in the task with a simple dict — this is task-specific logic, not framework config.
+
+### Evaluation
+
+- **Train-time eval** (`make_evaluate`): lightweight, runs every N epochs during training.
+  Must be fast — used for checkpointing and early stopping.
+- **Post-training eval** (`make_test_evaluate`): thorough, runs via `eval.py` and the
+  Evaluator class. Can compute expensive metrics and return predictions.
+- The **Evaluator** class is the eval counterpart to Trainer — handles Accelerate, checkpoint
+  loading, W&B/TensorBoard logging, prediction saving. Use as a building block in
+  `evaluate(cfg)` for non-standard eval patterns.
+- Eval function returns `dict` (metrics only) or `(dict, Any)` (metrics + predictions).
+  Predictions are saved automatically as `predictions.pt`.
+- The Evaluator auto-discovers `fold-*` directories for cross-validation aggregation.
+- Eval output: `eval_results.json` with metrics, checkpoint metadata, and per-fold breakdown.
+- Standardized training output artifacts per run:
+  - `config.yaml` — full resolved training configuration
+  - `metrics.jsonl` — per-epoch metrics
+  - `checkpoints/best/` — best checkpoint by validation metric
+
+### Optional task overrides
+
+Tasks can export any of these functions to customize behavior beyond the required interface:
+
+```python
+# Custom optimizer (default: AdamW with cfg.training.lr and cfg.training.weight_decay)
+def build_optimizer(model, cfg) -> Optimizer
+
+# Custom scheduler (default: cosine with linear warmup)
+def build_scheduler(optimizer, cfg) -> LRScheduler
+
+# Cross-validation: add fold param to build_dataloader
+def build_dataloader(cfg, split="train", fold=None) -> DataLoader
+# Then use sequential CV (training.folds: [0,1,2,3,4] in config)
+# or parallel CV (make sweep SWEEP="training.fold=0,1,2,3,4")
+
+# Post-CV aggregation (sequential CV only)
+def on_complete(cfg, fold_results) -> None
+
+# Eval callbacks (on_eval_begin, on_eval_end, on_checkpoint_loaded, on_run_evaluated)
+def build_eval_callbacks(cfg) -> list[EvalCallback]
+
+# Full training loop override — bypasses default loop, can use Trainer as building block
+def run(cfg) -> None
+
+# Full eval override — bypasses default eval, can use Evaluator as building block
+def evaluate(cfg) -> None
+```
+
+Flexibility levels:
+- **Standard**: implement required functions only → get Trainer + Evaluator + optimizer + scheduler + logging for free
+- **Customize**: add optional overrides → control optimizer, scheduler, eval callbacks
+- **Cross-validation**: add `fold` param to `build_dataloader` → fold loop, per-fold checkpoints, metric aggregation
+- **Full control**: export `run(cfg)` or `evaluate(cfg)` → use Trainer/Evaluator as building blocks
+
+### Mixed precision
+
+- Use Accelerate's mixed precision (bf16 preferred, fp16 fallback).
+- Configure via Accelerate config or `--mixed_precision bf16` flag.
+- Gradient scaling is handled by Accelerate automatically.
+
+## Project structure
+
+The project separates **library code** (publishable to PyPI) from **pipeline code** (training
+infrastructure). Only `src/{{ project_slug }}/` is distributed via `pip install`.
+
+```
+src/{{ project_slug }}/     Python package — distributed via pip install
+  models/                   Model architectures (pure PyTorch, minimal deps)
+  data/                     Datasets, transforms, collators (reusable data utilities)
+  utils.py                  Library utilities (seed_everything)
+experiments/                Training pipeline — NOT distributed
+  tasks/                    Training recipes (data wiring, loss, eval per experiment)
+  train.py                  Training entrypoint (task dispatch, fold handling)
+  eval.py                   Evaluation entrypoint (Evaluator, checkpoint loading, CV aggregation)
+  preprocess.py             Preprocessing entrypoint (config-hash output, skip-if-exists)
+  trainer.py                Trainer class (Accelerate, checkpointing, logging)
+  config.py                 OmegaConf resolver registration (dataset manifest)
+  utils.py                  Pipeline utilities (config hashing)
+configs/
+  config.yaml               Base config (Hydra entrypoint) — all defaults
+  experiment/               Experiment override configs (+experiment=name)
+  nodes/                    SLURM node tier configs (high, medium, low)
+tests/                      Tests (mirrors src/ structure)
+scripts/slurm/              SLURM job scripts (preprocess, train, eval, dev)
+scripts/docker/             Project Dockerfile
+```
+
+## Data layout on {{ nas_name }}
+
+```
+{{ nas_base_path }}/{{ project_slug }}/
+├── data/
+│   ├── raw/            ← source datasets (make copy-data / make snapshot)
+│   └── processed/      ← preprocessed/cached data
+├── checkpoints/        ← model checkpoints (written by Trainer)
+├── outputs/            ← training outputs, metrics, configs
+├── logs/               ← SLURM logs
+└── code/               ← rsync'd source code (make sync)
+```
+
+Locally mounted at: `{{ nas_mount_path }}/{{ project_slug }}/`
+
+### NAS filesystem restrictions
+
+The shared filesystem may **not** support changing file or directory permissions. This affects
+Python's `shutil` module:
+
+- **`shutil.copyfile()`** — works (copies data only)
+- **`shutil.copy()`** — **fails** (copies data + mode bits via `copymode`)
+- **`shutil.copy2()`** — **fails** (copies data + metadata via `copystat`)
+- **`shutil.copytree()`** — **fails** by default (calls `copy2` + `copystat` on dirs)
+- **`os.chmod()`** — **fails** (`Operation not permitted`)
+- **Hardlinks** (`os.link`, `cp -al`) — work fine
+- **Symlinks** (`os.symlink`) — work fine
+
+When copying files on NAS, always use `shutil.copyfile()` or hardlinks. The Trainer's
+`_copy_checkpoint` method handles this correctly.
+
+Data is NEVER committed to git. Use `make copy-data` or `make snapshot` to bring in datasets:
+```bash
+make copy-data SRC=/data/datasets/example NAME=example   # full copy
+make snapshot NAME=example                                # hardlink-copy (zero extra disk)
+```
+
+## Workflows
+
+### Local development
+```bash
+source .venv/bin/activate
+make install
+make test
+make train TRAIN_ARGS="training.epochs=5"
+```
+
+### Submit training to cluster
+```bash
+make submit                              # default tier ({{ default_tier }})
+make submit TIER=high                    # high-VRAM nodes (H200)
+make submit TIER=low GRES=gpu:2          # override SLURM params
+make sweep SWEEP="training.lr=0.001,0.01,0.1"  # parameter sweep (one job per value)
+make sweep SWEEP="training.lr=0.001,0.01 training.epochs=50,100"  # grid sweep
+```
+
+### Dev session on cluster
+```bash
+make dev                                 # default tier
+make dev TIER=high                       # high-VRAM node
+```
+
+### Monitoring
+```bash
+make status    # your jobs
+make logs      # tail latest output
+make cancel    # cancel latest job
+```
+
+## Environment variables
+
+Use `.env` (loaded by python-dotenv) for secrets and per-system config:
+
+```bash
+WANDB_API_KEY=...
+WANDB_PROJECT={{ project_slug }}
+HF_TOKEN=...
+```
+
+These are loaded at the top of train.py via `dotenv.load_dotenv()` and are injected into
+containers via `--export` in the SLURM scripts.
+
+## Git conventions
+
+- **Commit messages**: single line, imperative mood (e.g., "Add attention pooling module")
+- **No Co-Authored-By** in commit messages
+- **Tagging**: tag releases and milestones with semver (e.g., `git tag v0.1.0`)
+- Run `make lint` before committing
+
+## Conventions summary
+
+| Aspect | Convention |
+|--------|-----------|
+| Entrypoint | `make train` (runs `experiments.train` via Makefile) |
+| Config | YAML in `configs/`, managed by Hydra + OmegaConf — never hardcode params |
+| Training | Trainer class with Accelerate |
+| Logging | W&B (primary) + TensorBoard (fallback) + JSON metrics |
+| Progress | tqdm, never print() |
+| Data | Lazy loading, dict returns, NAS paths via env vars |
+| Checkpoints | Every N epochs, top-K, `epoch{N:03d}_{date}` naming |
+| Testing | pytest, TDD, correctness tests for models |
+| Formatting | ruff format + ruff check |
+| Env vars | python-dotenv, .env file (git-ignored) |
+| Seeding | Always seed everything (torch, numpy, random, CUDA) |
+| Commits | Single-line messages, no Co-Authored-By, tag milestones |

@@ -1,0 +1,126 @@
+"""Example task — synthetic data, working out of the box.
+
+A minimal task that trains a linear model on random data. Use this to verify
+the full pipeline works (preprocess → train → eval) before implementing
+your own task.
+
+    make preprocess PREPROCESS_ARGS="task=example"
+    make train TRAIN_ARGS="task=example training.epochs=5"
+    make eval EVAL_ARGS="task=example"
+"""
+
+import logging
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from {{ project_slug }}.data.example import TensorDirDataset
+from {{ project_slug }}.models import ExampleModel
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing
+# ---------------------------------------------------------------------------
+
+
+def preprocess(cfg) -> None:
+    """Generate synthetic dataset with train/val/test splits."""
+    out = Path(cfg.paths.processed_dir)
+    n_samples = 500
+    n_features = 16
+    n_classes = cfg.model.num_classes
+
+    torch.manual_seed(cfg.training.seed)
+    X = torch.randn(n_samples, n_features)
+    w = torch.randn(n_features, n_classes)
+    y = (X @ w).argmax(dim=1)
+
+    # Split: 60/20/20
+    splits = {"train": (0, 300), "val": (300, 400), "test": (400, 500)}
+    for name, (start, end) in splits.items():
+        split_dir = out / name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({"X": X[start:end], "y": y[start:end]}, split_dir / "data.pt")
+
+    log.info(f"Generated synthetic dataset: {n_samples} samples, {n_features} features, {n_classes} classes")
+
+
+# ---------------------------------------------------------------------------
+# Data, model, loss
+# ---------------------------------------------------------------------------
+
+
+def build_dataloader(cfg, split="train", fold=None) -> DataLoader:
+    dataset = TensorDirDataset(Path(cfg.paths.processed_dir) / split)
+    return DataLoader(
+        dataset,
+        batch_size=cfg.data.batch_size,
+        shuffle=(split == "train"),
+    )
+
+
+def build_model(cfg) -> torch.nn.Module:
+    return ExampleModel(
+        in_features=16,
+        hidden_dim=cfg.model.hidden_dim,
+        num_classes=cfg.model.num_classes,
+        dropout=cfg.model.dropout,
+    )
+
+
+def make_compute_loss(cfg):
+    def compute_loss(model, batch):
+        logits = model(batch["input"])
+        return F.cross_entropy(logits, batch["target"])
+    return compute_loss
+
+
+# ---------------------------------------------------------------------------
+# Train-time validation (fast)
+# ---------------------------------------------------------------------------
+
+
+def make_evaluate(cfg):
+    @torch.no_grad()
+    def evaluate(model, val_loader, accelerator):
+        model.eval()
+        total_loss, correct, total = 0.0, 0, 0
+        for batch in val_loader:
+            logits = model(batch["input"])
+            total_loss += F.cross_entropy(logits, batch["target"]).item()
+            correct += (logits.argmax(1) == batch["target"]).sum().item()
+            total += len(batch["target"])
+        return {"val_loss": total_loss / max(total, 1), "val_accuracy": correct / max(total, 1)}
+    return evaluate
+
+
+# ---------------------------------------------------------------------------
+# Post-training evaluation (thorough)
+# ---------------------------------------------------------------------------
+
+
+def make_test_evaluate(cfg):
+    @torch.no_grad()
+    def evaluate(model, test_loader, accelerator):
+        model.eval()
+        all_preds, all_targets = [], []
+        total_loss, n = 0.0, 0
+        for batch in test_loader:
+            logits = model(batch["input"])
+            total_loss += F.cross_entropy(logits, batch["target"]).item()
+            all_preds.append(logits.cpu())
+            all_targets.append(batch["target"].cpu())
+            n += 1
+
+        preds = torch.cat(all_preds)
+        targets = torch.cat(all_targets)
+        accuracy = (preds.argmax(1) == targets).float().mean().item()
+
+        metrics = {"test_loss": total_loss / max(n, 1), "test_accuracy": accuracy}
+        predictions = {"preds": preds, "targets": targets}
+        return metrics, predictions
+    return evaluate

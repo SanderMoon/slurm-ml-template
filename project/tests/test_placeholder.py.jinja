@@ -1,0 +1,22 @@
+"""Basic tests for {{ project_name }}."""
+
+import {{ project_slug }}
+from {{ project_slug }}.utils import seed_everything
+
+
+def test_import():
+    """Package is importable."""
+    assert hasattr({{ project_slug }}, "__doc__")
+
+
+def test_seed_everything():
+    """Seeding produces deterministic random numbers."""
+    import torch
+
+    seed_everything(42)
+    a = torch.randn(3)
+
+    seed_everything(42)
+    b = torch.randn(3)
+
+    assert torch.equal(a, b)

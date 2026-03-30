@@ -1,0 +1,514 @@
+"""Evaluation entrypoint for {{ project_name }}.
+
+Loads trained checkpoints, runs post-training evaluation on test data,
+and saves structured results. For cross-validation runs, auto-discovers
+fold directories and aggregates metrics across folds.
+
+The Evaluator class is the eval counterpart to Trainer — a composable
+engine that handles Accelerate, checkpoint loading, W&B/TensorBoard
+logging, prediction saving, and results serialization. Plug in your
+eval logic via make_test_evaluate.
+
+Task interface (required for eval):
+    build_dataloader(cfg, split="test", fold=None) -> DataLoader
+    build_model(cfg) -> nn.Module
+    make_test_evaluate(cfg) -> Callable  (falls back to make_evaluate)
+
+Task interface (optional overrides):
+    evaluate(cfg) -> None                # full eval override (bypass Evaluator)
+
+Usage:
+    make eval                                                # default config
+    make eval EVAL_ARGS="+experiment=my_experiment"           # experiment overlay
+    make eval EVAL_ARGS="eval.checkpoint=latest"             # latest checkpoint
+    make eval EVAL_ARGS="paths.checkpoint_dir=/path/to/checkpoints"
+"""
+
+import importlib
+import json
+import logging
+import re
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+
+import hydra
+import numpy as np
+import torch
+from accelerate import Accelerator
+from dotenv import load_dotenv
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+
+from experiments.config import register_resolvers
+from experiments.utils import resolve_processed_dir, resolve_run_hash
+from {{ project_slug }}.utils import seed_everything
+
+load_dotenv()
+register_resolvers()
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Callbacks
+# ---------------------------------------------------------------------------
+
+
+class EvalCallback:
+    """Base class for Evaluator callbacks. Override any method you need."""
+
+    def on_eval_begin(self, evaluator: "Evaluator") -> None:
+        """Called before any model or data is built."""
+
+    def on_eval_end(self, evaluator: "Evaluator", results: dict) -> None:
+        """Called after all evaluation, with the full results dict."""
+
+    def on_checkpoint_loaded(self, evaluator: "Evaluator", checkpoint_path: Path) -> None:
+        """Called after a checkpoint is loaded, before inference.
+        Use to attach hooks, inspect the model, etc."""
+
+    def on_run_evaluated(self, evaluator: "Evaluator", fold: int | None, metrics: dict) -> None:
+        """Called after each run/fold is evaluated, with that run's metrics."""
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+# ---------------------------------------------------------------------------
+
+
+class Evaluator:
+    """Reusable evaluation engine — the eval counterpart to Trainer.
+
+    Handles Accelerate setup, checkpoint loading, W&B/TensorBoard logging,
+    prediction saving, and results serialization. Plug in your eval logic
+    via the ``evaluate_fn`` callable.
+
+    Args:
+        model: Model to evaluate (CPU — Accelerate handles device).
+        test_loader: Pre-built test DataLoader.
+        evaluate_fn: Callable ``(model, test_loader, accelerator) -> result``.
+            Result is either ``dict`` (metrics only) or
+            ``(dict, Any)`` (metrics + predictions).
+        cfg: OmegaConf config.
+        checkpoint_dir: Directory containing checkpoints.
+        output_dir: Where to write results and predictions.
+        callbacks: Optional list of EvalCallback instances.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        test_loader: torch.utils.data.DataLoader,
+        evaluate_fn: Callable,
+        cfg: DictConfig,
+        checkpoint_dir: Path | None = None,
+        output_dir: Path | None = None,
+        callbacks: list[EvalCallback] | None = None,
+    ):
+        self.cfg = cfg
+        self.evaluate_fn = evaluate_fn
+        self.callbacks = callbacks or []
+
+        self.checkpoint_dir = checkpoint_dir or Path(cfg.paths.checkpoint_dir)
+        self.output_dir = output_dir or Path(cfg.paths.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.accelerator = Accelerator(
+            log_with=self._log_backends(),
+            project_dir=str(self.output_dir),
+        )
+
+        self.model, self.test_loader = self.accelerator.prepare(model, test_loader)
+
+        # Init trackers
+        if self.accelerator.is_main_process:
+            flat_config = _flatten_config(OmegaConf.to_container(cfg, resolve=True))
+            self.accelerator.init_trackers(
+                project_name=cfg.logging.wandb_project,
+                config=flat_config,
+                init_kwargs={"wandb": {"job_type": "eval"}},
+            )
+
+    def _log_backends(self) -> list[str]:
+        backends = ["tensorboard"]
+        if self.cfg.logging.use_wandb:
+            backends.append("wandb")
+        return backends
+
+    def fire(self, method: str, **kwargs):
+        """Fire a callback method on all registered callbacks."""
+        for cb in self.callbacks:
+            getattr(cb, method)(self, **kwargs)
+
+    def load_checkpoint(self, checkpoint: str = "best") -> Path:
+        """Load a checkpoint into the prepared model.
+
+        Args:
+            checkpoint: "best", "latest", or an explicit path.
+
+        Returns:
+            Path to the loaded checkpoint.
+        """
+        path = _resolve_checkpoint(self.cfg, self.checkpoint_dir, checkpoint)
+        log.info(f"Loading checkpoint: {path}")
+        self.accelerator.load_state(str(path))
+        self.fire("on_checkpoint_loaded", checkpoint_path=path)
+        return path
+
+    def evaluate(self, checkpoint: str | None = None) -> dict:
+        """Run evaluation on a single checkpoint.
+
+        Args:
+            checkpoint: "best", "latest", explicit path, or None to use
+                ``cfg.eval.checkpoint``.
+
+        Returns:
+            Dict with metrics, predictions path (if any), and checkpoint metadata.
+        """
+        self.fire("on_eval_begin")
+
+        checkpoint = checkpoint or self.cfg.eval.get("checkpoint", "best")
+        checkpoint_path = self.load_checkpoint(checkpoint)
+
+        # Run eval function
+        self.model.eval()
+        with torch.no_grad():
+            result = self.evaluate_fn(self.model, self.test_loader, self.accelerator)
+
+        # Unpack: result is either dict or (dict, predictions)
+        if isinstance(result, tuple):
+            metrics, predictions = result
+        else:
+            metrics, predictions = result, None
+
+        # Log metrics to W&B/TensorBoard
+        if self.accelerator.is_main_process:
+            self.accelerator.log(metrics, step=0)
+
+        # Save predictions if returned
+        predictions_path = None
+        if predictions is not None and self.accelerator.is_main_process:
+            predictions_path = self.output_dir / "predictions.pt"
+            torch.save(predictions, predictions_path)
+            log.info(f"Predictions saved to {predictions_path}")
+
+        # Read checkpoint metadata
+        meta_file = checkpoint_path / "metadata.json"
+        checkpoint_meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+
+        run_result = {
+            "metrics": metrics,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_meta": checkpoint_meta,
+        }
+        if predictions_path:
+            run_result["predictions"] = str(predictions_path)
+
+        self.fire("on_run_evaluated", fold=None, metrics=metrics)
+        self.fire("on_eval_end", results=run_result)
+        return run_result
+
+    def evaluate_folds(self, folds: list[int], fold_checkpoint_dirs: dict[int, Path],
+                       fold_loaders: dict[int, torch.utils.data.DataLoader]) -> dict:
+        """Evaluate multiple folds and aggregate metrics.
+
+        Args:
+            folds: List of fold indices.
+            fold_checkpoint_dirs: Mapping of fold index to checkpoint directory.
+            fold_loaders: Mapping of fold index to test DataLoader.
+
+        Returns:
+            Dict with per_fold results and aggregate metrics.
+        """
+        self.fire("on_eval_begin")
+
+        per_fold = []
+        checkpoint_choice = self.cfg.eval.get("checkpoint", "best")
+        prev_loader = None
+
+        for fold in tqdm(folds, desc="Folds", disable=not self.accelerator.is_main_process):
+            log.info("=" * 60)
+            log.info(f"Evaluating fold {fold}")
+            log.info("=" * 60)
+
+            # Free previous fold's dataloader
+            if prev_loader is not None:
+                del prev_loader
+                torch.cuda.empty_cache()
+
+            # Prepare this fold's dataloader (don't mutate self)
+            fold_loader = self.accelerator.prepare(fold_loaders[fold])
+            fold_ckpt_dir = fold_checkpoint_dirs[fold]
+
+            checkpoint_path = _resolve_checkpoint(self.cfg, fold_ckpt_dir, checkpoint_choice)
+            log.info(f"Loading checkpoint: {checkpoint_path}")
+            self.accelerator.load_state(str(checkpoint_path))
+            self.fire("on_checkpoint_loaded", checkpoint_path=checkpoint_path)
+
+            # Run eval
+            self.model.eval()
+            with torch.no_grad():
+                result = self.evaluate_fn(self.model, fold_loader, self.accelerator)
+
+            if isinstance(result, tuple):
+                metrics, predictions = result
+            else:
+                metrics, predictions = result, None
+
+            # Log fold metrics
+            if self.accelerator.is_main_process:
+                fold_prefix = {f"fold{fold}/{k}": v for k, v in metrics.items()}
+                self.accelerator.log(fold_prefix, step=fold)
+
+            # Save fold predictions
+            predictions_path = None
+            if predictions is not None and self.accelerator.is_main_process:
+                fold_output = self.output_dir / f"fold-{fold}"
+                fold_output.mkdir(parents=True, exist_ok=True)
+                predictions_path = fold_output / "predictions.pt"
+                torch.save(predictions, predictions_path)
+
+            meta_file = checkpoint_path / "metadata.json"
+            checkpoint_meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+
+            fold_result = {
+                "fold": fold,
+                "metrics": metrics,
+                "checkpoint": str(checkpoint_path),
+                "checkpoint_meta": checkpoint_meta,
+            }
+            if predictions_path:
+                fold_result["predictions"] = str(predictions_path)
+
+            per_fold.append(fold_result)
+            self.fire("on_run_evaluated", fold=fold, metrics=metrics)
+            prev_loader = fold_loader
+
+            for k, v in metrics.items():
+                log.info(f"  {k}: {v:.4f}")
+
+        # Aggregate
+        metric_keys = per_fold[0]["metrics"].keys()
+        aggregate = {}
+        for key in metric_keys:
+            values = [f["metrics"][key] for f in per_fold]
+            aggregate[f"{key}_mean"] = float(np.mean(values))
+            aggregate[f"{key}_std"] = float(np.std(values))
+
+        # Log aggregate
+        if self.accelerator.is_main_process:
+            self.accelerator.log(aggregate, step=len(folds))
+
+        log.info("=" * 60)
+        log.info("Aggregate results:")
+        for k, v in aggregate.items():
+            log.info(f"  {k}: {v:.4f}")
+
+        results = {
+            "num_folds": len(folds),
+            "per_fold": per_fold,
+            "aggregate": aggregate,
+        }
+        self.fire("on_eval_end", results=results)
+        return results
+
+    def finish(self):
+        """End tracking and clean up."""
+        self.accelerator.end_training()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_checkpoint(cfg: DictConfig, checkpoint_dir: Path, choice: str = "best") -> Path:
+    """Resolve checkpoint path.
+
+    Args:
+        cfg: Hydra config.
+        checkpoint_dir: Base checkpoint directory.
+        choice: "best", "latest", or explicit path.
+
+    Returns:
+        Path to the checkpoint directory to load.
+    """
+    if choice == "best":
+        path = checkpoint_dir / "best"
+    elif choice == "latest":
+        candidates = sorted(
+            [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith("epoch")],
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+        path = candidates[-1]
+    else:
+        path = Path(choice)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    return path
+
+
+def detect_folds(checkpoint_dir: Path) -> list[int] | None:
+    """Scan checkpoint directory for fold-* subdirectories.
+
+    Returns:
+        Sorted list of fold indices, or None if no folds found.
+    """
+    if not checkpoint_dir.exists():
+        return None
+    fold_dirs = [
+        p for p in checkpoint_dir.iterdir()
+        if p.is_dir() and re.match(r"fold-(\d+)$", p.name)
+    ]
+    if not fold_dirs:
+        return None
+    return sorted(int(re.match(r"fold-(\d+)$", p.name).group(1)) for p in fold_dirs)
+
+
+def _flatten_config(d: dict, prefix: str = "") -> dict:
+    """Flatten nested config to dot-separated scalar keys."""
+    flat = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}" if prefix else k
+        if isinstance(v, dict):
+            flat.update(_flatten_config(v, f"{key}."))
+        elif isinstance(v, (list, tuple)):
+            flat[key] = str(v)
+        elif v is None:
+            flat[key] = "null"
+        else:
+            flat[key] = v
+    return flat
+
+
+def _apply_eval_overrides(cfg: DictConfig) -> DictConfig:
+    """Apply eval-specific config overrides on top of the base config."""
+    overrides = cfg.eval.get("overrides", {})
+    if not overrides:
+        return cfg
+    cfg = OmegaConf.to_container(cfg, resolve=False)
+    for dotkey, value in overrides.items():
+        keys = dotkey.split(".")
+        d = cfg
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
+    cfg = OmegaConf.create(cfg)
+    log.info(f"Applied eval overrides: {dict(overrides)}")
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    seed_everything(cfg.training.seed)
+
+    # Compute run hash BEFORE eval overrides — must match training's hash
+    run_hash = resolve_run_hash(cfg)
+    OmegaConf.update(cfg, "paths.output_dir", str(Path(cfg.paths.output_dir) / run_hash))
+    OmegaConf.update(cfg, "paths.checkpoint_dir", str(Path(cfg.paths.checkpoint_dir) / run_hash))
+    log.info(f"Run hash: {run_hash}")
+
+    cfg = _apply_eval_overrides(cfg)
+
+    # Resolve processed_dir to config-hash path if it exists
+    hashed_dir = resolve_processed_dir(cfg)
+    if hashed_dir.exists():
+        OmegaConf.update(cfg, "paths.processed_dir", str(hashed_dir), force_add=True)
+
+    output_dir = Path(cfg.paths.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, output_dir / "eval_config.yaml")
+    log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
+
+    # Load task module
+    task_name = cfg.get("task", "example")
+    task = importlib.import_module(f"experiments.tasks.{task_name}")
+    log.info(f"Task: {task_name}")
+
+    # Full override: task.evaluate() takes complete control
+    # (can still use Evaluator internally as a building block)
+    evaluate_override = getattr(task, "evaluate", None)
+    if evaluate_override:
+        log.info("Using task.evaluate() override")
+        evaluate_override(cfg)
+        return
+
+    # Get eval function (make_test_evaluate is required for eval)
+    make_test_eval = getattr(task, "make_test_evaluate", None)
+    if make_test_eval is None:
+        raise AttributeError(
+            f"Task '{task_name}' must define make_test_evaluate(cfg) for post-training evaluation. "
+            f"make_evaluate is for train-time validation only."
+        )
+    evaluate_fn = make_test_eval(cfg)
+
+    # Collect callbacks
+    build_callbacks = getattr(task, "build_eval_callbacks", None)
+    callbacks = build_callbacks(cfg) if build_callbacks else []
+
+    checkpoint_dir = Path(cfg.paths.checkpoint_dir)
+    folds = detect_folds(checkpoint_dir)
+
+    if folds:
+        log.info(f"Detected {len(folds)} folds: {folds}")
+
+        # Build model once — weights are swapped per fold via load_checkpoint
+        model = task.build_model(cfg)
+        # Use first fold's loader for initial Evaluator construction
+        first_loader = task.build_dataloader(cfg, split="test", fold=folds[0])
+
+        evaluator = Evaluator(
+            model=model,
+            test_loader=first_loader,
+            evaluate_fn=evaluate_fn,
+            cfg=cfg,
+            checkpoint_dir=checkpoint_dir / f"fold-{folds[0]}",
+            output_dir=output_dir,
+            callbacks=callbacks,
+        )
+
+        # Build fold-specific loaders and checkpoint dirs
+        fold_checkpoint_dirs = {f: checkpoint_dir / f"fold-{f}" for f in folds}
+        fold_loaders = {folds[0]: first_loader}
+        for f in folds[1:]:
+            fold_loaders[f] = task.build_dataloader(cfg, split="test", fold=f)
+
+        fold_results = evaluator.evaluate_folds(folds, fold_checkpoint_dirs, fold_loaders)
+        results = {"task": task_name, **fold_results, "date": datetime.now().isoformat()}
+
+    else:
+        log.info("Single-run evaluation")
+        model = task.build_model(cfg)
+        test_loader = task.build_dataloader(cfg, split="test")
+
+        evaluator = Evaluator(
+            model=model,
+            test_loader=test_loader,
+            evaluate_fn=evaluate_fn,
+            cfg=cfg,
+            output_dir=output_dir,
+            callbacks=callbacks,
+        )
+
+        result = evaluator.evaluate()
+        results = {"task": task_name, **result, "date": datetime.now().isoformat()}
+
+    evaluator.finish()
+
+    # Save results
+    output_file = output_dir / cfg.eval.get("output_file", "eval_results.json")
+    output_file.write_text(json.dumps(results, indent=2, default=str))
+    log.info(f"Results saved to {output_file}")
+
+
+if __name__ == "__main__":
+    main()

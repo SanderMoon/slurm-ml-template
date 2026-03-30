@@ -1,0 +1,158 @@
+"""Smoke tests using the example task.
+
+Verifies the full pipeline works: preprocessing, model forward/backward,
+checkpointing, and evaluation. Catches integration issues before they
+waste GPU hours on the cluster.
+"""
+
+import json
+from pathlib import Path
+
+import torch
+from omegaconf import OmegaConf
+
+from experiments.tasks import example as task
+
+
+def _make_cfg(tmp_path: Path) -> OmegaConf:
+    """Create a minimal config for testing."""
+    return OmegaConf.create({
+        "task": "example",
+        "paths": {
+            "data_dir": str(tmp_path / "data"),
+            "processed_dir": str(tmp_path / "processed"),
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "output_dir": str(tmp_path / "outputs"),
+        },
+        "model": {"num_classes": 2, "hidden_dim": 32, "dropout": 0.0},
+        "data": {"batch_size": 16, "num_workers": 0},
+        "training": {"seed": 42, "epochs": 3, "lr": 0.01, "weight_decay": 0.0001, "max_grad_norm": 1.0},
+        "checkpointing": {
+            "save_every_n_epochs": 1, "keep_top_k": 2,
+            "val_metric": "val_loss", "val_metric_mode": "min",
+        },
+        "logging": {"log_every_n_steps": 1, "use_wandb": False, "wandb_project": "test"},
+        "preprocess": {},
+        "eval": {"checkpoint": "best", "output_file": "eval_results.json", "overrides": {}},
+    })
+
+
+def test_preprocess(tmp_path):
+    """Preprocessing creates train/val/test splits."""
+    cfg = _make_cfg(tmp_path)
+    task.preprocess(cfg)
+
+    for split in ["train", "val", "test"]:
+        data_file = Path(cfg.paths.processed_dir) / split / "data.pt"
+        assert data_file.exists(), f"Missing {split}/data.pt"
+        data = torch.load(data_file, weights_only=True)
+        assert "X" in data and "y" in data
+
+
+def test_dataloader(tmp_path):
+    """Dataloader returns batches with correct shapes."""
+    cfg = _make_cfg(tmp_path)
+    task.preprocess(cfg)
+
+    loader = task.build_dataloader(cfg, split="train")
+    batch = next(iter(loader))
+    assert batch["input"].shape == (16, 16)  # batch_size x features
+    assert batch["target"].shape == (16,)
+
+
+def test_model_forward_backward(tmp_path):
+    """Model forward pass produces correct shape, backward pass produces gradients."""
+    cfg = _make_cfg(tmp_path)
+    model = task.build_model(cfg)
+
+    X = torch.randn(8, 16)
+    logits = model(X)
+    assert logits.shape == (8, 2)  # batch x num_classes
+
+    loss = torch.nn.functional.cross_entropy(logits, torch.zeros(8, dtype=torch.long))
+    loss.backward()
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"No gradient for {name}"
+
+
+def test_train_loop(tmp_path):
+    """Full training loop completes and produces checkpoints + metrics."""
+    cfg = _make_cfg(tmp_path)
+    task.preprocess(cfg)
+
+    from experiments.trainer import Trainer
+
+    train_loader = task.build_dataloader(cfg, split="train")
+    val_loader = task.build_dataloader(cfg, split="val")
+    model = task.build_model(cfg)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr)
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        compute_loss=task.make_compute_loss(cfg),
+        cfg=cfg,
+        val_loader=val_loader,
+        evaluate=task.make_evaluate(cfg),
+    )
+    trainer.train()
+
+    # Check outputs
+    assert (Path(cfg.paths.output_dir) / "metrics.jsonl").exists()
+    assert (Path(cfg.paths.checkpoint_dir) / "best").exists()
+
+
+def test_checkpoint_resume(tmp_path):
+    """Checkpoint save + load restores model weights."""
+    cfg = _make_cfg(tmp_path)
+    task.preprocess(cfg)
+
+    model = task.build_model(cfg)
+    train_loader = task.build_dataloader(cfg, split="train")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr)
+
+    from experiments.trainer import Trainer
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        compute_loss=task.make_compute_loss(cfg),
+        cfg=cfg,
+    )
+    trainer.train()
+
+    # Load best checkpoint into a fresh model
+    best_path = Path(cfg.paths.checkpoint_dir) / "best"
+    assert best_path.exists()
+
+    meta = json.loads((best_path / "metadata.json").read_text())
+    assert "epoch" in meta
+    assert "run_id" in meta
+
+
+def test_evaluate(tmp_path):
+    """Evaluation produces metrics and predictions."""
+    cfg = _make_cfg(tmp_path)
+    task.preprocess(cfg)
+
+    model = task.build_model(cfg)
+    test_loader = task.build_dataloader(cfg, split="test")
+
+    from accelerate import Accelerator
+    accelerator = Accelerator()
+    model, test_loader = accelerator.prepare(model, test_loader)
+
+    evaluate_fn = task.make_test_evaluate(cfg)
+    model.eval()
+    with torch.no_grad():
+        result = evaluate_fn(model, test_loader, accelerator)
+
+    # Should return (metrics, predictions) tuple
+    assert isinstance(result, tuple)
+    metrics, predictions = result
+    assert "test_loss" in metrics
+    assert "test_accuracy" in metrics
+    assert "preds" in predictions
+    assert "targets" in predictions

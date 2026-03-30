@@ -1,0 +1,252 @@
+"""Training entrypoint for {{ project_name }}.
+
+Dispatches to task modules based on the ``task`` config key. Each task
+provides its own dataloaders, model, loss, and evaluation logic. The
+Trainer handles the rest (Accelerate, checkpointing, logging, preemption).
+
+Task interface (required):
+    build_dataloader(cfg, split, fold) -> DataLoader
+    build_model(cfg) -> nn.Module
+    make_compute_loss(cfg) -> Callable[[nn.Module, dict], Tensor]
+    make_evaluate(cfg) -> Callable[[nn.Module, DataLoader, Accelerator], dict]
+
+Task interface (optional overrides):
+    build_optimizer(model, cfg) -> Optimizer
+    build_scheduler(optimizer, cfg) -> LRScheduler
+    on_complete(cfg, fold_results) -> None     # post-training aggregation (sequential folds)
+    run(cfg) -> None                           # full loop override
+
+Usage:
+    make train                                            # default task
+    make train TRAIN_ARGS="task=example"                   # explicit
+    make train TRAIN_ARGS="+experiment=my_exp"            # experiment overlay
+    make train TRAIN_ARGS="training.lr=0.01"              # CLI override
+"""
+
+import importlib
+import logging
+from pathlib import Path
+
+import hydra
+import torch
+from dotenv import load_dotenv
+from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+from experiments.config import register_resolvers
+from experiments.trainer import EarlyStoppingCallback, Trainer
+from experiments.utils import resolve_processed_dir, resolve_run_hash
+from {{ project_slug }}.utils import seed_everything
+
+load_dotenv()
+register_resolvers()
+
+log = logging.getLogger(__name__)
+
+
+def build_optimizer(model: torch.nn.Module, cfg: DictConfig) -> torch.optim.Optimizer:
+    """Default optimizer: AdamW with lr and weight_decay from config."""
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
+    )
+
+
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig):
+    """Default scheduler: linear warmup + cosine decay."""
+    warmup = cfg.training.get("warmup_epochs", 0)
+    total = cfg.training.epochs
+    if warmup == 0:
+        return CosineAnnealingLR(optimizer, T_max=total)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(total - warmup, 1))
+    return SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup])
+
+
+def _build_callbacks(cfg: DictConfig) -> list:
+    """Build default callbacks from config."""
+    callbacks = []
+    es = cfg.training.get("early_stopping", {})
+    if es.get("enabled", False):
+        callbacks.append(EarlyStoppingCallback(
+            patience=es.get("patience", 10),
+            min_delta=es.get("min_delta", 0.0),
+        ))
+    return callbacks
+
+
+def _resolve_resume(cfg: DictConfig) -> Path | None | bool:
+    """Resolve resume_from config: path, null (auto-resume), or false (fresh start)."""
+    val = cfg.resume_from
+    if val is False:
+        return False
+    if val:
+        return Path(val)
+    return None
+
+
+def _run_single(task, cfg: DictConfig) -> None:
+    """Standard training: single run, no cross-validation."""
+    task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
+    task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
+
+    train_loader = task.build_dataloader(cfg, split="train")
+    val_loader = task.build_dataloader(cfg, split="val")
+    model = task.build_model(cfg)
+    optimizer = task_build_optimizer(model, cfg)
+    scheduler = task_build_scheduler(optimizer, cfg)
+    resume_from = _resolve_resume(cfg)
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        compute_loss=task.make_compute_loss(cfg),
+        cfg=cfg,
+        val_loader=val_loader,
+        scheduler=scheduler,
+        evaluate=task.make_evaluate(cfg),
+        resume_from=resume_from,
+        callbacks=_build_callbacks(cfg),
+    )
+    trainer.train()
+
+
+def _run_fold_single(task, cfg: DictConfig) -> None:
+    """Single fold from config (for parallel CV via ``make sweep SWEEP="training.fold=0,1,2,3,4"``)."""
+    fold = cfg.training.fold
+    output_dir = Path(cfg.paths.output_dir)
+
+    task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
+    task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
+
+    log.info(f"Training fold {fold}")
+
+    train_loader = task.build_dataloader(cfg, split="train", fold=fold)
+    val_loader = task.build_dataloader(cfg, split="val", fold=fold)
+    model = task.build_model(cfg)
+    optimizer = task_build_optimizer(model, cfg)
+    scheduler = task_build_scheduler(optimizer, cfg)
+
+    fold_checkpoint_dir = Path(cfg.paths.checkpoint_dir) / f"fold-{fold}"
+    fold_output_dir = output_dir / f"fold-{fold}"
+    resume_from = _resolve_resume(cfg)
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        compute_loss=task.make_compute_loss(cfg),
+        cfg=cfg,
+        val_loader=val_loader,
+        scheduler=scheduler,
+        evaluate=task.make_evaluate(cfg),
+        checkpoint_dir=fold_checkpoint_dir,
+        output_dir=fold_output_dir,
+        resume_from=resume_from,
+        callbacks=_build_callbacks(cfg),
+    )
+    trainer.train()
+
+
+def _run_folds(task, cfg: DictConfig) -> None:
+    """Cross-validation loop: iterate folds, assemble Trainer per fold."""
+    output_dir = Path(cfg.paths.output_dir)
+
+    task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
+    task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
+
+    folds = cfg.training.folds
+    fold_results = []
+
+    for fold in folds:
+        log.info("=" * 60)
+        log.info(f"Fold {fold}")
+        log.info("=" * 60)
+
+        train_loader = task.build_dataloader(cfg, split="train", fold=fold)
+        val_loader = task.build_dataloader(cfg, split="val", fold=fold)
+        model = task.build_model(cfg)
+        optimizer = task_build_optimizer(model, cfg)
+        scheduler = task_build_scheduler(optimizer, cfg)
+
+        fold_checkpoint_dir = Path(cfg.paths.checkpoint_dir) / f"fold-{fold}"
+        fold_output_dir = output_dir / f"fold-{fold}"
+        resume_from = _resolve_resume(cfg)
+
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            compute_loss=task.make_compute_loss(cfg),
+            cfg=cfg,
+            val_loader=val_loader,
+            scheduler=scheduler,
+            evaluate=task.make_evaluate(cfg),
+            checkpoint_dir=fold_checkpoint_dir,
+            output_dir=fold_output_dir,
+            resume_from=resume_from,
+            callbacks=_build_callbacks(cfg),
+        )
+        trainer.train()
+
+        fold_results.append({
+            "fold": fold,
+            "checkpoint_dir": fold_checkpoint_dir,
+            "output_dir": fold_output_dir,
+            "run_id": trainer.run_id,
+            "best_metric": trainer.best_metric,
+        })
+
+    # Post-training hook
+    on_complete = getattr(task, "on_complete", None)
+    if on_complete:
+        log.info("Running post-training hook...")
+        on_complete(cfg, fold_results)
+
+    log.info("All folds complete.")
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    seed_everything(cfg.training.seed)
+
+    # Resolve processed_dir to config-hash path if it was created by preprocess.py.
+    # If the hashed dir doesn't exist, keep the configured path as-is (e.g., a direct path).
+    hashed_dir = resolve_processed_dir(cfg)
+    if hashed_dir.exists():
+        OmegaConf.update(cfg, "paths.processed_dir", str(hashed_dir), force_add=True)
+
+    # Hash-based run directories: different configs get isolated output/checkpoint dirs.
+    # This prevents auto-resume from picking up checkpoints from a different experiment.
+    run_hash = resolve_run_hash(cfg)
+    OmegaConf.update(cfg, "paths.output_dir", str(Path(cfg.paths.output_dir) / run_hash))
+    OmegaConf.update(cfg, "paths.checkpoint_dir", str(Path(cfg.paths.checkpoint_dir) / run_hash))
+    log.info(f"Run hash: {run_hash}")
+
+    # Save resolved config
+    output_dir = Path(cfg.paths.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, output_dir / "config.yaml")
+    log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
+
+    # Load task module
+    task_name = cfg.get("task", "example")
+    task = importlib.import_module(f"experiments.tasks.{task_name}")
+    log.info(f"Task: {task_name}")
+
+    # Full override: task.run() takes complete control
+    run_fn = getattr(task, "run", None)
+    if run_fn:
+        run_fn(cfg)
+    elif cfg.training.get("folds"):
+        _run_folds(task, cfg)
+    elif cfg.training.get("fold") is not None:
+        _run_fold_single(task, cfg)
+    else:
+        _run_single(task, cfg)
+
+
+if __name__ == "__main__":
+    main()

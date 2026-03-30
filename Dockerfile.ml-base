@@ -1,0 +1,31 @@
+# ML base image — common ML dependencies on top of a GPU-enabled base.
+# This layer changes only when template-level deps change (rarely).
+#
+# This is a REFERENCE IMPLEMENTATION for building a shared base image.
+# Your team builds this once, pushes to a shared registry, and all generated
+# projects reference it via the base_docker_image copier prompt.
+#
+# Customize the FROM line to your own GPU-enabled base image (must have
+# Python + uv installed). PyTorch should be pre-installed in the base.
+#
+# Build:  docker build --platform linux/amd64 -f Dockerfile.ml-base -t ml-base:latest .
+# Push:   docker push <your-registry>/<your-namespace>/ml-base:latest
+ARG BASE_IMAGE=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+FROM ${BASE_IMAGE}
+
+# Allow system-wide pip installs (Docker container, no need for venv isolation)
+RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+# Install common ML project dependencies (shared across all projects from this template).
+RUN uv pip install --system \
+    accelerate \
+    hydra-core \
+    omegaconf \
+    tqdm \
+    python-dotenv \
+    wandb \
+    tensorboard \
+    hatchling \
+    torchvision \
+    numpy \
+    scikit-learn
