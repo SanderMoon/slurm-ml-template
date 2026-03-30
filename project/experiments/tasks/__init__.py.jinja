@@ -25,6 +25,7 @@ Optional overrides:
     on_complete(cfg, fold_results) -> None         # sequential CV post-hook
     run(cfg) -> None                               # full training loop override
     evaluate(cfg) -> None                          # full eval loop override
+    build_fsdp_wrap_policy(model, cfg) -> Callable # FSDP auto-wrap policy
 
 Usage:
     make train TRAIN_ARGS="task=example training.epochs=5"

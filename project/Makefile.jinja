@@ -79,6 +79,7 @@ endif
 
 PREPROCESS_ARGS ?=
 TRAIN_ARGS ?=
+NUM_GPUS   ?= 0
 EVAL_ARGS  ?=
 SLURM_MAIL ?=
 SBATCH_MAIL_ARGS := $(if $(SLURM_MAIL),--mail-user=$(SLURM_MAIL),)
@@ -100,8 +101,12 @@ install: ## Install project in editable mode with dev deps
 preprocess: ## Run preprocessing locally
 	python -m experiments.preprocess $(PREPROCESS_ARGS)
 
-train: ## Run training locally
+train: ## Run training locally (NUM_GPUS=4 for multi-GPU)
+ifeq ($(shell test $(NUM_GPUS) -gt 1 2>/dev/null && echo yes),yes)
+	accelerate launch --num_processes=$(NUM_GPUS) -m experiments.train $(TRAIN_ARGS)
+else
 	python -m experiments.train $(TRAIN_ARGS)
+endif
 
 eval: ## Run evaluation locally
 	python -m experiments.eval $(EVAL_ARGS)

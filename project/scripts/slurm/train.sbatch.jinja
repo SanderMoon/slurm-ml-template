@@ -41,10 +41,8 @@ uv pip install -e . --no-deps -q
 
 mkdir -p "${NAS_CHECKPOINTS}" "${NAS_OUTPUTS}" logs
 
-# --- Distributed env (single-node) ---
-export WORLD_SIZE=1
-export RANK=0
-export LOCAL_RANK=0
+# --- Distributed env (single-node, auto-detect GPUs) ---
+NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
 export MASTER_ADDR=localhost
 export MASTER_PORT=29500
 
@@ -62,11 +60,14 @@ fi
 
 # --- Train ---
 export DATA_DIR="${DATA_PATH}"  # Used by the ${data:name} config resolver
-echo "Starting training..."
-python -m experiments.train \
-    paths.checkpoint_dir="${NAS_CHECKPOINTS}" \
-    paths.data_dir="${DATA_PATH}" \
-    paths.processed_dir="${DATA_PATH}/processed" \
-    paths.output_dir="${NAS_OUTPUTS}" \
-    ${TRAIN_ARGS:-}
+HYDRA_ARGS="paths.checkpoint_dir=${NAS_CHECKPOINTS} paths.data_dir=${DATA_PATH} paths.processed_dir=${DATA_PATH}/processed paths.output_dir=${NAS_OUTPUTS} ${TRAIN_ARGS:-}"
+
+if [ "${NUM_GPUS}" -gt 1 ]; then
+    echo "Multi-GPU: launching with accelerate (${NUM_GPUS} GPUs)..."
+    accelerate launch --num_processes="${NUM_GPUS}" \
+        -m experiments.train ${HYDRA_ARGS}
+else
+    echo "Single-GPU: direct launch..."
+    python -m experiments.train ${HYDRA_ARGS}
+fi
 echo "Done at $(date)"

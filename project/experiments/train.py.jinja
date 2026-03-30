@@ -86,6 +86,12 @@ def _resolve_resume(cfg: DictConfig) -> Path | None | bool:
     return None
 
 
+def _build_fsdp_wrap_policy(task, model, cfg):
+    """Build FSDP wrap policy from task if provided."""
+    builder = getattr(task, "build_fsdp_wrap_policy", None)
+    return builder(model, cfg) if builder else None
+
+
 def _run_single(task, cfg: DictConfig) -> None:
     """Standard training: single run, no cross-validation."""
     task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
@@ -109,6 +115,7 @@ def _run_single(task, cfg: DictConfig) -> None:
         evaluate=task.make_evaluate(cfg),
         resume_from=resume_from,
         callbacks=_build_callbacks(cfg),
+        fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
     )
     trainer.train()
 
@@ -146,6 +153,7 @@ def _run_fold_single(task, cfg: DictConfig) -> None:
         output_dir=fold_output_dir,
         resume_from=resume_from,
         callbacks=_build_callbacks(cfg),
+        fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
     )
     trainer.train()
 
@@ -188,6 +196,7 @@ def _run_folds(task, cfg: DictConfig) -> None:
             output_dir=fold_output_dir,
             resume_from=resume_from,
             callbacks=_build_callbacks(cfg),
+            fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
         )
         trainer.train()
 

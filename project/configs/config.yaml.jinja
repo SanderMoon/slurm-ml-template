@@ -84,6 +84,15 @@ eval:
   #   data.tta: true
   overrides: {}
 
+distributed:
+  strategy: auto              # auto | ddp | fsdp (auto = Accelerate decides)
+  fsdp:                       # ignored unless strategy: fsdp
+    version: 2                # FSDP version (1 or 2)
+    sharding_strategy: FULL_SHARD  # FULL_SHARD | SHARD_GRAD_OP | NO_SHARD
+    cpu_offload: false
+    state_dict_type: FULL_STATE_DICT  # FULL_STATE_DICT | SHARDED_STATE_DICT
+    reshard_after_forward: true
+
 logging:
   log_every_n_steps: 10
   use_wandb: {{ use_wandb | lower }}
