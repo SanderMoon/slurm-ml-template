@@ -8,8 +8,6 @@
 #   NAS_DATA        — data directory
 #   NAS_OUTPUTS     — output directory (for logs)
 # =============================================================================
-#SBATCH --output=logs/slurm-%j.out
-#SBATCH --error=logs/slurm-%j.err
 #SBATCH --open-mode=append
 #SBATCH --mail-type=END,FAIL
 #SBATCH --no-container-entrypoint
@@ -33,7 +31,7 @@ uv venv --system-site-packages "${VENV}"
 source "${VENV}/bin/activate"
 uv pip install -e . --no-deps -q
 
-mkdir -p "${NAS_DATA}/processed" logs
+mkdir -p "${NAS_DATA}/processed"
 
 # --- Preprocess ---
 export DATA_DIR="${NAS_DATA}"

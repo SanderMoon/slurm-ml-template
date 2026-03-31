@@ -8,8 +8,6 @@
 #   NAS_CHECKPOINTS — checkpoint directory
 #   NAS_OUTPUTS     — output directory
 # =============================================================================
-#SBATCH --output=logs/slurm-%j.out
-#SBATCH --error=logs/slurm-%j.err
 #SBATCH --open-mode=append
 #SBATCH --mail-type=END,FAIL
 #SBATCH --no-container-entrypoint
@@ -35,7 +33,7 @@ uv venv --system-site-packages "${VENV}"
 source "${VENV}/bin/activate"
 uv pip install -e . --no-deps -q
 
-mkdir -p "${NAS_OUTPUTS}" logs
+mkdir -p "${NAS_OUTPUTS}"
 
 # --- Distributed env (single-node) ---
 export WORLD_SIZE=1

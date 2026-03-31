@@ -211,6 +211,8 @@ PREPROCESS_GRES ?=
 define sbatch_preprocess_cmd
 ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
 	--job-name=prep-$(PROJECT_SLUG) \
+	--output=$(NAS_LOGS)/slurm-%j.out \
+	--error=$(NAS_LOGS)/slurm-%j.err \
 	--nodes=1 \
 	--nodelist=$(NODELIST) \
 	$(if $(PREPROCESS_GRES),--gres=$(PREPROCESS_GRES),) \
@@ -232,6 +234,8 @@ submit-preprocess: sync ## Sync + submit preprocessing job (CPU-only, add PREPRO
 define sbatch_cmd
 ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
 	--job-name=$(PROJECT_SLUG) \
+	--output=$(NAS_LOGS)/slurm-%j.out \
+	--error=$(NAS_LOGS)/slurm-%j.err \
 	--nodes=1 \
 	--nodelist=$(NODELIST) \
 	--gres=$(GRES) \
@@ -275,6 +279,8 @@ sweep-results: ## Compare sweep runs (SWEEP_DIR=outputs/sweep, add --eval for ev
 define sbatch_eval_cmd
 ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
 	--job-name=eval-$(PROJECT_SLUG) \
+	--output=$(NAS_LOGS)/slurm-%j.out \
+	--error=$(NAS_LOGS)/slurm-%j.err \
 	--nodes=1 \
 	--nodelist=$(NODELIST) \
 	--gres=$(GRES) \
@@ -315,6 +321,8 @@ print(f'Submitting {len(grid)} eval jobs...', file=sys.stderr); \
 dev: sync ## Sync + launch interactive dev session (TIER=high ...)
 	ssh $(REMOTE_HOST) "cd $(NAS_CODE) && sbatch \
 		--job-name=dev-$(PROJECT_SLUG) \
+		--output=$(NAS_LOGS)/slurm-%j.out \
+		--error=$(NAS_LOGS)/slurm-%j.err \
 		--nodes=1 \
 		--nodelist=$(NODELIST) \
 		--gres=$(GRES) \
@@ -334,11 +342,11 @@ dev: sync ## Sync + launch interactive dev session (TIER=high ...)
 
 logs: ## Tail SLURM job output (JOB=id for specific job, default: latest)
 	@if [ -d "$(NAS_MOUNT)" ]; then \
-		JOB=$${JOB:-$$(ls "$(LOCAL_NAS_PATH)/code/logs/slurm-"*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)}; \
+		JOB=$${JOB:-$$(ls "$(LOCAL_NAS_PATH)/logs/slurm-"*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)}; \
 		echo "=== Job $${JOB} ===" && \
-		tail -f "$(LOCAL_NAS_PATH)/code/logs/slurm-$${JOB}.out" "$(LOCAL_NAS_PATH)/code/logs/slurm-$${JOB}.err"; \
+		tail -f "$(LOCAL_NAS_PATH)/logs/slurm-$${JOB}.out" "$(LOCAL_NAS_PATH)/logs/slurm-$${JOB}.err"; \
 	else \
-		ssh $(REMOTE_HOST) "JOB=$${JOB:-\$$(ls $(NAS_CODE)/logs/slurm-*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)} && echo '=== Job \$${JOB} ===' && tail -f $(NAS_CODE)/logs/slurm-\$${JOB}.out $(NAS_CODE)/logs/slurm-\$${JOB}.err"; \
+		ssh $(REMOTE_HOST) "JOB=$${JOB:-\$$(ls $(NAS_LOGS)/slurm-*.out 2>/dev/null | grep -o '[0-9]*' | sort -n | tail -1)} && echo '=== Job \$${JOB} ===' && tail -f $(NAS_LOGS)/slurm-\$${JOB}.out $(NAS_LOGS)/slurm-\$${JOB}.err"; \
 	fi
 
 logs-all: ## Tail all running SLURM job outputs
@@ -346,10 +354,10 @@ logs-all: ## Tail all running SLURM job outputs
 	if [ -z "$$JOBS" ]; then echo "No running jobs."; exit 0; fi; \
 	FILES=""; \
 	for JOB in $$JOBS; do \
-		FILES="$$FILES $(NAS_CODE)/logs/slurm-$${JOB}.out $(NAS_CODE)/logs/slurm-$${JOB}.err"; \
+		FILES="$$FILES $(NAS_LOGS)/slurm-$${JOB}.out $(NAS_LOGS)/slurm-$${JOB}.err"; \
 	done; \
 	if [ -d "$(NAS_MOUNT)" ]; then \
-		tail -f $$(echo "$$FILES" | sed "s|$(NAS_CODE)|$(LOCAL_NAS_PATH)/code|g"); \
+		tail -f $$(echo "$$FILES" | sed "s|$(NAS_LOGS)|$(LOCAL_NAS_PATH)/logs|g"); \
 	else \
 		ssh $(REMOTE_HOST) "tail -f $$FILES"; \
 	fi
