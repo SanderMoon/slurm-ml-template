@@ -27,6 +27,11 @@ paths:
 # Resume from a specific checkpoint (null = auto-resume from latest)
 resume_from: null
 
+# Override the computed run hash (null = auto-compute from config).
+# Useful for eval when the training config differs from the current config.
+# Usage: make eval EVAL_ARGS="task=example run_hash=4c708155"
+run_hash: null
+
 model:
   num_classes: 2
   hidden_dim: 256

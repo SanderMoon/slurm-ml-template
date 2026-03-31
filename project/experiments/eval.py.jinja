@@ -417,8 +417,9 @@ def main(cfg: DictConfig) -> None:
     if hashed_dir.exists():
         OmegaConf.update(cfg, "paths.processed_dir", str(hashed_dir), force_add=True)
 
-    # Compute run hash BEFORE eval overrides — must match training's hash
-    run_hash = resolve_run_hash(cfg)
+    # Compute run hash BEFORE eval overrides — must match training's hash.
+    # Allow explicit override via run_hash config key.
+    run_hash = cfg.get("run_hash") or resolve_run_hash(cfg)
     OmegaConf.update(cfg, "paths.output_dir", str(Path(cfg.paths.output_dir) / run_hash))
     OmegaConf.update(cfg, "paths.checkpoint_dir", str(Path(cfg.paths.checkpoint_dir) / run_hash))
     log.info(f"Run hash: {run_hash}")
