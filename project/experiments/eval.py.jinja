@@ -411,6 +411,12 @@ def _apply_eval_overrides(cfg: DictConfig) -> DictConfig:
 def main(cfg: DictConfig) -> None:
     seed_everything(cfg.training.seed)
 
+    # Resolve processed_dir BEFORE run hash — must match training's order so that
+    # any interpolations referencing paths.processed_dir resolve identically.
+    hashed_dir = resolve_processed_dir(cfg)
+    if hashed_dir.exists():
+        OmegaConf.update(cfg, "paths.processed_dir", str(hashed_dir), force_add=True)
+
     # Compute run hash BEFORE eval overrides — must match training's hash
     run_hash = resolve_run_hash(cfg)
     OmegaConf.update(cfg, "paths.output_dir", str(Path(cfg.paths.output_dir) / run_hash))
@@ -418,11 +424,6 @@ def main(cfg: DictConfig) -> None:
     log.info(f"Run hash: {run_hash}")
 
     cfg = _apply_eval_overrides(cfg)
-
-    # Resolve processed_dir to config-hash path if it exists
-    hashed_dir = resolve_processed_dir(cfg)
-    if hashed_dir.exists():
-        OmegaConf.update(cfg, "paths.processed_dir", str(hashed_dir), force_add=True)
 
     output_dir = Path(cfg.paths.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
