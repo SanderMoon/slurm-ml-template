@@ -126,6 +126,12 @@ class Trainer:
             each optimizer step instead of after each epoch.
         fsdp_wrap_policy: Optional FSDP auto-wrap policy callable.
             Provided by tasks via ``build_fsdp_wrap_policy(model, cfg)``.
+        extra_state: Optional dict of ``{name: nn.Module}`` for auxiliary
+            modules that need checkpointing but should NOT be wrapped by
+            Accelerate (no DDP/FSDP, no optimizer). Typical use cases:
+            EMA teacher models, frozen tokenizers, discriminators.
+            These are moved to the Accelerate device, saved/loaded alongside
+            the main checkpoint, and accessible as ``trainer.extra_state``.
     """
 
     def __init__(
@@ -144,6 +150,7 @@ class Trainer:
         callbacks: list[TrainerCallback] | None = None,
         scheduler_step_per_batch: bool = False,
         fsdp_wrap_policy: Callable | None = None,
+        extra_state: dict[str, torch.nn.Module] | None = None,
     ):
         self.cfg = cfg
         self.callbacks = callbacks or []
@@ -164,6 +171,12 @@ class Trainer:
         self.model, self.optimizer, self.train_loader = self.accelerator.prepare(model, optimizer, train_loader)
         self.val_loader = self.accelerator.prepare(val_loader) if val_loader else None
         self.scheduler = scheduler
+
+        # Extra state: auxiliary modules that need checkpointing but not Accelerate wrapping
+        self.extra_state = extra_state or {}
+        for name, module in self.extra_state.items():
+            module.to(self.accelerator.device)
+            log.info(f"Extra state '{name}': {sum(p.numel() for p in module.parameters()):,} params → {self.accelerator.device}")
 
         self.global_step = 0
         self.start_epoch = 0
@@ -468,6 +481,13 @@ class Trainer:
 
         self.accelerator.save_state(str(path))
 
+        # Save extra state (teacher models, etc.) alongside Accelerate state
+        if self.extra_state and self.accelerator.is_main_process:
+            extra_dir = path / "extra_state"
+            extra_dir.mkdir(exist_ok=True)
+            for name, module in self.extra_state.items():
+                torch.save(module.state_dict(), extra_dir / f"{name}.pt")
+
         if self.accelerator.is_main_process:
             metadata = {
                 "epoch": epoch,
@@ -546,6 +566,15 @@ class Trainer:
     def _load_checkpoint(self, path: Path):
         log.info(f"Resuming from {path}")
         self.accelerator.load_state(str(path))
+
+        # Restore extra state
+        extra_dir = path / "extra_state"
+        if extra_dir.exists() and self.extra_state:
+            for name, module in self.extra_state.items():
+                state_path = extra_dir / f"{name}.pt"
+                if state_path.exists():
+                    module.load_state_dict(torch.load(state_path, map_location=self.accelerator.device, weights_only=True))
+                    log.info(f"Restored extra state '{name}' from {state_path}")
 
         meta_file = path / "metadata.json"
         if meta_file.exists():
