@@ -152,9 +152,44 @@ def build_eval_callbacks(cfg):
     return [MyCallback()]
 ```
 
+## Extra state (teacher-student, GANs, auxiliary models)
+
+For training patterns that need auxiliary models (EMA teacher, discriminator, frozen tokenizer), export `build_extra_state` from your task. The returned modules are checkpointed automatically and passed to your loss function and callbacks:
+
+```python
+import copy
+
+def build_extra_state(model, cfg) -> dict[str, torch.nn.Module]:
+    """Create auxiliary modules. Called after build_model()."""
+    teacher = copy.deepcopy(model)
+    teacher.requires_grad_(False)
+    return {"teacher": teacher}
+
+def make_compute_loss(cfg, extra_state=None):
+    """When build_extra_state is exported, extra_state is passed as second arg."""
+    teacher = extra_state["teacher"]
+
+    def compute_loss(model, batch):
+        student_out = model(batch["image"])
+        with torch.no_grad():
+            teacher_out = teacher(batch["image"])
+        loss = distillation_loss(student_out, teacher_out)
+        return {"loss": loss}
+    return compute_loss
+
+def build_callbacks(cfg, extra_state) -> list:
+    """Build task-specific callbacks that reference extra_state."""
+    return [EMACallback(extra_state["teacher"], momentum=0.996)]
+```
+
+The framework handles:
+- Moving extra_state modules to the correct device
+- Saving/loading extra_state alongside checkpoints
+- Passing extra_state to `make_compute_loss` and `build_callbacks`
+
 ## Full training loop override
 
-For GANs, multi-stage training, or anything that doesn't fit the standard single-model loop, export `run(cfg)` from your task:
+For multi-stage training or anything that doesn't fit the standard loop even with extra_state, export `run(cfg)` from your task:
 
 ```python
 from experiments.trainer import Trainer
@@ -266,8 +301,10 @@ All of these are optional exports from your task module:
 |----------|-------------------|
 | `build_optimizer(model, cfg)` | Default AdamW |
 | `build_scheduler(optimizer, cfg)` | Default cosine + warmup |
+| `build_extra_state(model, cfg)` | No auxiliary modules |
+| `build_callbacks(cfg, extra_state)` | No task-specific callbacks |
 | `build_fsdp_wrap_policy(model, cfg)` | No auto-wrap policy |
-| `build_eval_callbacks(cfg)` | No callbacks |
+| `build_eval_callbacks(cfg)` | No eval callbacks |
 | `on_complete(cfg, fold_results)` | No-op after sequential CV |
 | `run(cfg)` | Entire training loop |
 | `evaluate(cfg)` | Entire eval pipeline |
@@ -277,6 +314,7 @@ All of these are optional exports from your task module:
 | Level | What you implement | What you get for free |
 |-------|---|---|
 | **Standard** | Required functions only | Trainer + Evaluator, optimizer, scheduler, logging |
+| **Teacher-student** | + `build_extra_state`, `build_callbacks` | EMA teacher, auxiliary model checkpointing |
 | **Cross-validation** | + `fold` param on `build_dataloader` | Fold loop, per-fold checkpoints/outputs, metric aggregation |
 | **Customize** | + optional overrides | Control optimizer, scheduler, eval callbacks |
 | **Full control** | `run(cfg)` / `evaluate(cfg)` | Use Trainer/Evaluator as building blocks |

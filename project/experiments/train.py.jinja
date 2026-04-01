@@ -13,8 +13,16 @@ Task interface (required):
 Task interface (optional overrides):
     build_optimizer(model, cfg) -> Optimizer
     build_scheduler(optimizer, cfg) -> LRScheduler
+    build_extra_state(model, cfg) -> dict[str, nn.Module]  # teacher, discriminator, etc.
+    build_callbacks(cfg, extra_state) -> list[TrainerCallback]
     on_complete(cfg, fold_results) -> None     # post-training aggregation (sequential folds)
     run(cfg) -> None                           # full loop override
+
+When ``build_extra_state`` is exported, the returned dict is:
+  - moved to the Accelerate device
+  - passed to ``make_compute_loss(cfg, extra_state)`` as a second arg
+  - passed to ``build_callbacks(cfg, extra_state)`` if exported
+  - saved/loaded alongside checkpoints via Trainer's ``extra_state``
 
 Usage:
     make train                                            # default task
@@ -64,15 +72,17 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig):
     return SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup])
 
 
-def _build_callbacks(cfg: DictConfig) -> list:
-    """Build default callbacks from config."""
+def _build_default_callbacks(cfg: DictConfig) -> list:
+    """Build default callbacks from config (early stopping, etc.)."""
     callbacks = []
     es = cfg.training.get("early_stopping", {})
     if es.get("enabled", False):
-        callbacks.append(EarlyStoppingCallback(
-            patience=es.get("patience", 10),
-            min_delta=es.get("min_delta", 0.0),
-        ))
+        callbacks.append(
+            EarlyStoppingCallback(
+                patience=es.get("patience", 10),
+                min_delta=es.get("min_delta", 0.0),
+            )
+        )
     return callbacks
 
 
@@ -86,49 +96,21 @@ def _resolve_resume(cfg: DictConfig) -> Path | None | bool:
     return None
 
 
-def _build_fsdp_wrap_policy(task, model, cfg):
-    """Build FSDP wrap policy from task if provided."""
-    builder = getattr(task, "build_fsdp_wrap_policy", None)
-    return builder(model, cfg) if builder else None
+def _build_trainer(
+    task,
+    cfg: DictConfig,
+    *,
+    fold: int | None = None,
+    checkpoint_dir: Path | None = None,
+    output_dir: Path | None = None,
+) -> Trainer:
+    """Build a Trainer from task functions and config.
 
-
-def _run_single(task, cfg: DictConfig) -> None:
-    """Standard training: single run, no cross-validation."""
+    Centralizes the wiring shared by single-run, fold-single, and fold-loop
+    paths: model, optimizer, scheduler, extra_state, callbacks, compute_loss.
+    """
     task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
     task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
-
-    train_loader = task.build_dataloader(cfg, split="train")
-    val_loader = task.build_dataloader(cfg, split="val")
-    model = task.build_model(cfg)
-    optimizer = task_build_optimizer(model, cfg)
-    scheduler = task_build_scheduler(optimizer, cfg)
-    resume_from = _resolve_resume(cfg)
-
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        optimizer=optimizer,
-        compute_loss=task.make_compute_loss(cfg),
-        cfg=cfg,
-        val_loader=val_loader,
-        scheduler=scheduler,
-        evaluate=task.make_evaluate(cfg),
-        resume_from=resume_from,
-        callbacks=_build_callbacks(cfg),
-        fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
-    )
-    trainer.train()
-
-
-def _run_fold_single(task, cfg: DictConfig) -> None:
-    """Single fold from config (for parallel CV via ``make sweep SWEEP="training.fold=0,1,2,3,4"``)."""
-    fold = cfg.training.fold
-    output_dir = Path(cfg.paths.output_dir)
-
-    task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
-    task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
-
-    log.info(f"Training fold {fold}")
 
     train_loader = task.build_dataloader(cfg, split="train", fold=fold)
     val_loader = task.build_dataloader(cfg, split="val", fold=fold)
@@ -136,35 +118,65 @@ def _run_fold_single(task, cfg: DictConfig) -> None:
     optimizer = task_build_optimizer(model, cfg)
     scheduler = task_build_scheduler(optimizer, cfg)
 
-    fold_checkpoint_dir = Path(cfg.paths.checkpoint_dir) / f"fold-{fold}"
-    fold_output_dir = output_dir / f"fold-{fold}"
-    resume_from = _resolve_resume(cfg)
+    # Extra state: teacher models, discriminators, loss modules, etc.
+    extra_state = {}
+    build_extra = getattr(task, "build_extra_state", None)
+    if build_extra:
+        extra_state = build_extra(model, cfg)
 
-    trainer = Trainer(
+    # Compute loss: pass extra_state when the task uses it
+    if extra_state:
+        compute_loss = task.make_compute_loss(cfg, extra_state)
+    else:
+        compute_loss = task.make_compute_loss(cfg)
+
+    # Callbacks: framework defaults + task-specific
+    callbacks = _build_default_callbacks(cfg)
+    task_build_callbacks = getattr(task, "build_callbacks", None)
+    if task_build_callbacks:
+        callbacks.extend(task_build_callbacks(cfg, extra_state))
+
+    return Trainer(
         model=model,
         train_loader=train_loader,
         optimizer=optimizer,
-        compute_loss=task.make_compute_loss(cfg),
+        compute_loss=compute_loss,
         cfg=cfg,
         val_loader=val_loader,
         scheduler=scheduler,
         evaluate=task.make_evaluate(cfg),
-        checkpoint_dir=fold_checkpoint_dir,
-        output_dir=fold_output_dir,
-        resume_from=resume_from,
-        callbacks=_build_callbacks(cfg),
-        fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
+        checkpoint_dir=checkpoint_dir,
+        output_dir=output_dir,
+        resume_from=_resolve_resume(cfg),
+        callbacks=callbacks,
+        fsdp_wrap_policy=getattr(task, "build_fsdp_wrap_policy", lambda m, c: None)(model, cfg),
+        extra_state=extra_state or None,
+    )
+
+
+def _run_single(task, cfg: DictConfig) -> None:
+    """Standard training: single run, no cross-validation."""
+    trainer = _build_trainer(task, cfg)
+    trainer.train()
+
+
+def _run_fold_single(task, cfg: DictConfig) -> None:
+    """Single fold from config (for parallel CV via ``make sweep SWEEP="training.fold=0,1,2,3,4"``)."""
+    fold = cfg.training.fold
+    log.info(f"Training fold {fold}")
+
+    trainer = _build_trainer(
+        task,
+        cfg,
+        fold=fold,
+        checkpoint_dir=Path(cfg.paths.checkpoint_dir) / f"fold-{fold}",
+        output_dir=Path(cfg.paths.output_dir) / f"fold-{fold}",
     )
     trainer.train()
 
 
 def _run_folds(task, cfg: DictConfig) -> None:
     """Cross-validation loop: iterate folds, assemble Trainer per fold."""
-    output_dir = Path(cfg.paths.output_dir)
-
-    task_build_optimizer = getattr(task, "build_optimizer", build_optimizer)
-    task_build_scheduler = getattr(task, "build_scheduler", build_scheduler)
-
     folds = cfg.training.folds
     fold_results = []
 
@@ -173,30 +185,15 @@ def _run_folds(task, cfg: DictConfig) -> None:
         log.info(f"Fold {fold}")
         log.info("=" * 60)
 
-        train_loader = task.build_dataloader(cfg, split="train", fold=fold)
-        val_loader = task.build_dataloader(cfg, split="val", fold=fold)
-        model = task.build_model(cfg)
-        optimizer = task_build_optimizer(model, cfg)
-        scheduler = task_build_scheduler(optimizer, cfg)
-
         fold_checkpoint_dir = Path(cfg.paths.checkpoint_dir) / f"fold-{fold}"
-        fold_output_dir = output_dir / f"fold-{fold}"
-        resume_from = _resolve_resume(cfg)
+        fold_output_dir = Path(cfg.paths.output_dir) / f"fold-{fold}"
 
-        trainer = Trainer(
-            model=model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            compute_loss=task.make_compute_loss(cfg),
-            cfg=cfg,
-            val_loader=val_loader,
-            scheduler=scheduler,
-            evaluate=task.make_evaluate(cfg),
+        trainer = _build_trainer(
+            task,
+            cfg,
+            fold=fold,
             checkpoint_dir=fold_checkpoint_dir,
             output_dir=fold_output_dir,
-            resume_from=resume_from,
-            callbacks=_build_callbacks(cfg),
-            fsdp_wrap_policy=_build_fsdp_wrap_policy(task, model, cfg),
         )
         trainer.train()
 
